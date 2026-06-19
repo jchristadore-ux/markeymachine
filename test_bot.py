@@ -195,6 +195,29 @@ class TestDailyLossCheck:
         result2 = bot.daily_loss_check(50.0)
         assert result2 is False
 
+    def test_pct_cap_binds_before_dollar_cap(self, monkeypatch):
+        """v9.1.0: on a large bankroll the % cap halts before the $ cap would."""
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)   # dollar cap never binds
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
+        monkeypatch.setattr(bot, "session_start_balance", 2000.0)  # 6% = $120
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        monkeypatch.setattr(bot, "paper_daily_pnl", -100.0)  # above the $120 cap
+        assert bot.daily_loss_check(1900.0) is True
+        monkeypatch.setattr(bot, "paper_daily_pnl", -130.0)  # past the $120 cap
+        assert bot.daily_loss_check(1870.0) is False
+
+    def test_dollar_cap_still_binds_for_small_account(self, monkeypatch):
+        """The fixed $ cap is retained for tiny accounts where it is tighter."""
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 15.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
+        monkeypatch.setattr(bot, "session_start_balance", 20.0)  # 6% = $1.20
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        # pct cap ($1.20) is tighter than $15 here, so it binds first
+        monkeypatch.setattr(bot, "paper_daily_pnl", -2.0)
+        assert bot.daily_loss_check(18.0) is False
+
 
 class TestSpreadCheck:
     def test_normal(self):
@@ -345,6 +368,15 @@ class TestKellyBet:
         monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         assert bot.kelly_bet(0.70, 0, 25.0) == 0.0
         assert bot.kelly_bet(0.70, 100, 25.0) == 0.0
+
+    def test_capped_at_bet_fraction(self, monkeypatch):
+        """v9.1.0: a single bet never exceeds MAX_BET_FRACTION of bankroll."""
+        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 1_000.0)  # dollar cap not binding
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 1.0)
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)
+        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
+        bet = bot.kelly_bet(0.90, 40, 1_000.0)
+        assert bet <= 1_000.0 * 0.04 + 0.01
 
 
 class TestComputeMomentum:
@@ -793,3 +825,70 @@ class TestPaperModeAccounting:
         assert correct_win != buggy_win
         assert correct_win - start_balance == count - cost  # net = profit
         assert buggy_win - start_balance == 0.0             # net = $0 (wrong)
+
+
+class TestUpdateSessionState:
+    """v9.1.0 recovery state machine: entry timestamp + hard timeout backstop."""
+
+    def setup_method(self):
+        bot.session_state         = SessionState.ACTIVE
+        bot.recovery_entry_wins   = 0
+        bot.recovery_entry_losses = 0
+        bot.recovery_entered_ts   = 0.0
+        bot.live_wins             = 0
+        bot.live_losses           = 0
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def test_entry_stamps_recovery_time(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
+        bot.session_state = SessionState.ACTIVE
+        bot.update_session_state(1750.0)  # 12.5% loss → enter RECOVERY
+        assert bot.session_state == SessionState.RECOVERY
+        assert bot.recovery_entered_ts > 0.0
+
+    def test_timeout_forces_exit(self, monkeypatch):
+        """The deadlock backstop: stuck in RECOVERY past RECOVERY_MAX_SECS → ACTIVE."""
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
+        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
+        bot.session_state       = SessionState.RECOVERY
+        bot.recovery_entered_ts = time.time() - 7200  # 2h ago
+        bot.update_session_state(1750.0)  # still 12.5% down, 0 trades since entry
+        assert bot.session_state == SessionState.ACTIVE
+
+    def test_within_timeout_stays_recovery(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
+        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
+        bot.session_state       = SessionState.RECOVERY
+        bot.recovery_entered_ts = time.time() - 60  # 1 min ago
+        bot.update_session_state(1750.0)
+        assert bot.session_state == SessionState.RECOVERY
+
+    def test_zero_timestamp_is_initialized_not_instant_exit(self, monkeypatch):
+        """A stale 0.0 ts (recovery entered by an older build) must not instant-exit."""
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
+        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
+        bot.session_state       = SessionState.RECOVERY
+        bot.recovery_entered_ts = 0.0
+        bot.update_session_state(1750.0)
+        assert bot.session_state == SessionState.RECOVERY
+        assert bot.recovery_entered_ts > 0.0
+
+    def test_balance_heal_still_exits(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
+        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
+        bot.session_state       = SessionState.RECOVERY
+        bot.recovery_entered_ts = time.time() - 60
+        bot.update_session_state(1850.0)  # 7.5% loss ≤ 10% trigger → heal exit
+        assert bot.session_state == SessionState.ACTIVE

@@ -1,10 +1,34 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.9  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.1.0  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.9 — RECOVERY DEADLOCK FIX (balance-based recovery exit)                ║
+║  v9.1.0 — RECOVERY DEADLOCK (real fix) + RISK TIGHTENING                     ║
 ║                                                                              ║
+║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.9, 3.5h slice, ZERO trades):      ║
+║  - Status byte-identical all window:                                        ║
+║      $1722.52 │ PnL=$-246.87 │ WR=1/4 │ RECOVERY (rec+1)                     ║
+║  - Drawdown 12.5% (> 10% trigger). v9.0.9's balance-heal exit needs the     ║
+║    drawdown to recover to ≤10%, but the drawdown cannot heal without        ║
+║    trading, and the AGREE gate blocks every NEUTRAL-momentum scan. The      ║
+║    v9.0.7/8/9 patches each fixed a symptom; the self-referential lock       ║
+║    survived at any drawdown that did not pre-heal below the trigger.        ║
+║                                                                              ║
+║  FIX (deadlock):                                                            ║
+║  1. Remove the RECOVERY "momentum==AGREE" gate. CONFLICT is already         ║
+║     blocked for every state; allowing NEUTRAL lets recovery trade out at    ║
+║     reduced size so its own exits become reachable.                         ║
+║  2. RECOVERY_MAX_SECS hard timeout in update_session_state() — force back   ║
+║     to ACTIVE if recovery cannot clear in the window. The state machine     ║
+║     can no longer lock permanently, independent of (1).                     ║
+║                                                                              ║
+║  FIX (risk — a normal 1W/4L streak cost 12.5% of bankroll):                 ║
+║  3. MAX_BET_FRACTION 0.08 → 0.04 (cap a single binary bet at 4% of bank).   ║
+║  4. MAX_DAILY_LOSS_PCT (6%) — daily stop now halts on the tighter of the    ║
+║     fixed dollar cap and a fraction of the session-start balance, so the    ║
+║     mis-scaled $15 default can no longer be silently out-scaled.            ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
 ║  DIAGNOSIS (2026-06-15 LIVE session, v9.0.8, ~3h slice, ZERO trades):       ║
 ║  - Portfolio status byte-identical all window:                              ║
 ║      $16.30 │ PnL=$-1.43 │ WR=2/4 │ RECOVERY (rec+2)                         ║
@@ -98,7 +122,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.9"
+BOT_VERSION = "9.1.0"
 
 import base64
 import logging
@@ -188,7 +212,10 @@ POLL_INTERVAL       = _env_int("POLL_INTERVAL_SECS", 30)
 
 # ── Capital & sizing ──────────────────────────────────────────────────────────
 TRADE_SIZE_CAP      = _env_float("TRADE_SIZE_DOLLARS", 5.0)
-MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.08)
+# v9.1.0: 0.08 → 0.04. At 8% of bankroll per binary bet, an ordinary 4-loss
+# streak costs ~12.5% of the account in one session (2026-06-18: −$246.87 on
+# 1W/4L). Halving the per-bet fraction bounds a cold-streak session.
+MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.04)
 KELLY_FRACTION      = _env_float("KELLY_FRACTION", 0.30)
 KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
 
@@ -201,6 +228,12 @@ LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 # ── Risk controls ─────────────────────────────────────────────────────────────
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
 MAX_DAILY_LOSS        = _env_float("MAX_DAILY_LOSS_DOLLARS", 15.0)
+# v9.1.0: percentage-based daily stop. The fixed $15 cap is mis-scaled for
+# anything but a tiny paper account — on a ~$1969 bankroll it never bound, so
+# the session bled to −$246.87 (12.5%) before RECOVERY froze it. Halt when the
+# session drawdown exceeds the dollar cap OR this fraction of the start balance,
+# whichever binds first.
+MAX_DAILY_LOSS_PCT    = _env_float("MAX_DAILY_LOSS_PCT", 0.06)
 SESSION_STOP_FRACTION = _env_float("SESSION_STOP_FRACTION", 0.40)
 MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 2)
 STREAK_PAUSE_SECS     = _env_int("STREAK_PAUSE_SECS", 1800)
@@ -251,6 +284,10 @@ NEUTRAL_ACCURACY_DRAG  = _env_float("NEUTRAL_ACCURACY_DRAG", 0.0)
 RECOVERY_TRIGGER_PCT  = _env_float("RECOVERY_TRIGGER_PCT", 0.10)
 RECOVERY_EXIT_TRADES  = _env_int("RECOVERY_EXIT_TRADES", 5)
 RECOVERY_WIN_RATE_MIN = _env_float("RECOVERY_WIN_RATE_MIN", 0.60)
+# v9.1.0: hard wall-clock backstop. If recovery cannot clear via the trade-count
+# or balance-heal exits within this window, force-return to ACTIVE so the state
+# machine can never permanently lock itself out of trading again.
+RECOVERY_MAX_SECS     = _env_int("RECOVERY_MAX_SECS", 3600)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,6 +425,7 @@ session_state:         SessionState = SessionState.ACTIVE
 recovery_trades:       int          = 0
 recovery_entry_wins:   int          = 0
 recovery_entry_losses: int          = 0
+recovery_entered_ts:   float        = 0.0
 _session_start_ts:     str          = ""
 _session_halted:       bool         = False
 _shutdown_requested:   bool         = False
@@ -869,6 +907,7 @@ def get_session_score() -> int:
 
 def update_session_state(current_balance: float) -> None:
     global session_state, recovery_trades, recovery_entry_wins, recovery_entry_losses
+    global recovery_entered_ts
 
     if session_state == SessionState.HALTED:
         return
@@ -881,6 +920,7 @@ def update_session_state(current_balance: float) -> None:
             recovery_trades       = 0
             recovery_entry_wins   = live_wins
             recovery_entry_losses = live_losses
+            recovery_entered_ts   = time.time()
             log.warning("SESSION RECOVERY │ loss %.1f%% │ entry snapshot W=%d L=%d",
                         loss_pct * 100, recovery_entry_wins, recovery_entry_losses)
             tg.send_telegram_message(
@@ -889,6 +929,24 @@ def update_session_state(current_balance: float) -> None:
             )
 
     elif session_state == SessionState.RECOVERY:
+        # v9.1.0: HARD TIMEOUT BACKSTOP. The trade-count and balance-heal exits
+        # both require the bot to keep trading; if some confluence of gates still
+        # starves recovery of trades, this guarantees the state machine cannot
+        # lock forever. recovery_entered_ts can be 0.0 if recovery was entered by
+        # a pre-v9.1.0 process — treat that as "now" so we never instantly exit
+        # on a stale-zero timestamp.
+        if recovery_entered_ts <= 0.0:
+            recovery_entered_ts = time.time()
+        elif time.time() - recovery_entered_ts > RECOVERY_MAX_SECS:
+            session_state = SessionState.ACTIVE
+            log.warning("RECOVERY EXITED │ timeout %.0fs elapsed (loss %.1f%%)",
+                        time.time() - recovery_entered_ts, loss_pct * 100)
+            tg.send_telegram_message(
+                f"✅ Recovery exited — {RECOVERY_MAX_SECS//60}min timeout "
+                f"(loss {loss_pct*100:.1f}%)"
+            )
+            return
+
         # v9.0.9: BALANCE-BASED EXIT (primary).
         # Recovery entry is gated on loss_pct > RECOVERY_TRIGGER_PCT; the exit
         # must be reachable the same way. The trade-count exit below deadlocks
@@ -1424,9 +1482,14 @@ def daily_loss_check(balance: float) -> bool:
     if _session_halted:
         return False
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
-    if pnl <= -MAX_DAILY_LOSS:
+    # v9.1.0: halt on the tighter of the fixed dollar cap and a percentage of the
+    # session-start balance. The $15 default never bound on a ~$1969 bankroll, so
+    # a cold streak ran to −$246.87 (12.5%) before RECOVERY froze it.
+    pct_cap = MAX_DAILY_LOSS_PCT * session_start_balance if session_start_balance > 0 else 0.0
+    loss_cap = min(MAX_DAILY_LOSS, pct_cap) if pct_cap > 0 else MAX_DAILY_LOSS
+    if pnl <= -loss_cap:
         _session_halted = True
-        log.warning("DAILY LOSS │ $%.2f — halted.", abs(pnl))
+        log.warning("DAILY LOSS │ $%.2f ≥ cap $%.2f — halted.", abs(pnl), loss_cap)
         telegram_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
         return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
@@ -1686,10 +1749,16 @@ def run_decision(market: dict, balance: float) -> None:
         last_signal_desc = f"CONFLICT OB={ob_dir}"
         return
 
-    if session_state == SessionState.RECOVERY and momentum_verdict != "AGREE":
-        log.info("Recovery │ AGREE required, got %s", momentum_verdict)
-        last_signal_desc = "recovery: AGREE required"
-        return
+    # v9.1.0: the old "RECOVERY requires momentum==AGREE" gate is removed. It was
+    # a self-referential lock: in a calm market momentum is NEUTRAL on nearly
+    # every scan, so 100% of recovery signals were rejected, no trades could
+    # accumulate, and neither recovery exit (trade-count or balance-heal) was
+    # reachable — the bot froze in RECOVERY indefinitely (2026-06-18: 3.5h, 0
+    # trades). CONFLICT is already blocked for every state above; allowing
+    # NEUTRAL lets recovery trade its way out at reduced size (KELLY_RECOVERY_MULT)
+    # while every other safety gate (regime, OB dominance, win-prob, confidence,
+    # edge) still applies. RECOVERY_MAX_SECS in update_session_state() is the
+    # hard backstop against any residual lock.
 
     win_prob = bayesian_win_prob(ob, momentum_verdict, momentum_adj,
                                   regime, r_squared, realized_vol)
