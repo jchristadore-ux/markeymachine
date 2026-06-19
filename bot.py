@@ -1400,7 +1400,7 @@ def cancel_stale_orders() -> None:
             log.info("Stale cancel (paper) │ %s │ $%.2f", ticker[-15:], cost)
         else:
             try:
-                _delete(f"/portfolio/orders/{oid}")
+                _delete(f"/portfolio/events/orders/{oid}")
                 open_orders.pop(oid)
                 active_tickers.discard(ticker)
                 log.info("Stale cancel (live) │ %s │ %s", ticker[-15:], oid[:12])
@@ -1582,22 +1582,28 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
         )
         return client_id
 
+    # Kalshi V2 single-book order model (POST /portfolio/events/orders).
+    # The legacy /portfolio/orders endpoint was deprecated and now returns
+    # HTTP 410. V2 quotes a single YES book: side="bid" buys YES, side="ask"
+    # buys NO (buying NO at L cents == selling YES at (100 - L) cents). Price
+    # and count are fixed-point dollar/contract strings, and time_in_force and
+    # self_trade_prevention_type are required.
+    is_yes     = direction.upper() == "YES"
+    yes_cents  = limit_cents if is_yes else (100 - limit_cents)
     body: dict = {
-        "ticker":          ticker,
-        "client_order_id": client_id,
-        "type":            "limit",
-        "action":          "buy",
-        "side":            direction.lower(),
-        "count":           count,
+        "ticker":                     ticker,
+        "client_order_id":            client_id,
+        "side":                       "bid" if is_yes else "ask",
+        "count":                      str(count),
+        "price":                      f"{yes_cents / 100:.4f}",
+        "time_in_force":              "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
     }
-    if direction.upper() == "YES":
-        body["yes_price_dollars"] = f"{limit_cents / 100:.2f}"
-    else:
-        body["no_price_dollars"] = f"{limit_cents / 100:.2f}"
 
     try:
-        resp     = _post("/portfolio/orders", body)
-        order_id = resp.get("order", {}).get("order_id", client_id)
+        resp     = _post("/portfolio/events/orders", body)
+        order_id = (resp.get("order", {}).get("order_id")
+                    or resp.get("order_id") or client_id)
         last_trade_ts = time.time()
         rec = {
             "time": datetime.now(timezone.utc).isoformat(),
