@@ -122,7 +122,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.1.0"
+BOT_VERSION = "9.2.0"
 
 import base64
 import logging
@@ -427,6 +427,7 @@ recovery_entry_wins:   int          = 0
 recovery_entry_losses: int          = 0
 recovery_entered_ts:   float        = 0.0
 _session_start_ts:     str          = ""
+_session_day:          str          = ""
 _session_halted:       bool         = False
 _shutdown_requested:   bool         = False
 _last_known_balance:   float        = 0.0
@@ -763,6 +764,15 @@ def bayesian_win_prob(
     else:
         regime_adj = 0.0
 
+    # v9.2.0: the order-book imbalance is the bot's primary directional signal,
+    # yet it never fed the win-probability — win_prob was a near-constant ~0.68
+    # every scan, so "edge" was driven purely by how cheap the contract was (a
+    # 36c against-trend YES scored a fake 31% edge on 2026-06-19). Reward genuine
+    # book dominance over the trigger threshold so a marginally-imbalanced book
+    # scores lower than a lopsided one. Capped so it cannot dominate the prior.
+    eff_thresh    = ob.get("eff_thresh", OB_IMBALANCE_THRESH)
+    imbalance_adj = min(0.06, max(0.0, ob["imbalance"] - eff_thresh) * 0.30)
+
     depth_adj = 0.0
     if ob["total_depth"] > 500:
         depth_adj = min(0.02, math.log10(ob["total_depth"] / 500) * 0.02)
@@ -770,11 +780,11 @@ def bayesian_win_prob(
     vol_penalty = min(0.04, realized_vol / VOLATILITY_CAP_PCT * 0.04)
 
     win_prob = max(0.50, min(0.92,
-        prior + momentum_adj + regime_adj + depth_adj - vol_penalty
+        prior + momentum_adj + regime_adj + imbalance_adj + depth_adj - vol_penalty
     ))
 
-    log.info("WinProb │ prior=%.3f mom=%.3f regime=%.3f depth=%.3f vol=-%.3f → %.3f",
-             prior, momentum_adj, regime_adj, depth_adj, vol_penalty, win_prob)
+    log.info("WinProb │ prior=%.3f mom=%.3f regime=%.3f imb=%.3f depth=%.3f vol=-%.3f → %.3f",
+             prior, momentum_adj, regime_adj, imbalance_adj, depth_adj, vol_penalty, win_prob)
     return win_prob
 
 
@@ -1880,6 +1890,46 @@ def run_decision(market: dict, balance: float) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DAILY SESSION ROLLOVER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def maybe_roll_session_day(current_balance: float) -> bool:
+    """Reset the daily risk budget at the UTC day boundary.
+
+    The daily-loss cap is, by name, a *daily* limit — but the old code latched
+    `_session_halted` permanently, so once the cap was hit the bot slept "1hr"
+    forever and needed a redeploy to trade again (2026-06-19: idle 13:25→next
+    day). Here a new UTC day clears the halt, re-baselines the drawdown
+    references to the live balance, and wipes the per-session ticker/streak
+    state — so a fresh day always starts with a fresh budget and no manual
+    intervention. Returns True when a rollover happened.
+    """
+    global _session_day, _session_halted, session_start_balance
+    global session_stop_threshold, daily_pnl, paper_daily_pnl, consecutive_losses
+    global session_state, streak_pause_until
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today == _session_day:
+        return False
+
+    was_halted   = _session_halted
+    _session_day = today
+    _session_halted        = False
+    session_start_balance  = current_balance
+    session_stop_threshold = current_balance * SESSION_STOP_FRACTION
+    daily_pnl              = 0.0
+    paper_daily_pnl        = 0.0
+    consecutive_losses     = 0
+    streak_pause_until     = 0.0
+    session_state          = SessionState.ACTIVE
+    session_traded_tickers.clear()
+
+    log.info("🔄 New trading day %s │ balance $%.2f │ daily budget reset%s",
+             today, current_balance, " (halt cleared)" if was_halted else "")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1900,12 +1950,13 @@ def main() -> None:
     global live_wins, live_losses, streak_pause_until
     global _last_known_balance, _shutdown_requested, _session_start_ts
     global _session_halted, session_state, recovery_trades
-    global recovery_entry_wins, recovery_entry_losses
+    global recovery_entry_wins, recovery_entry_losses, _session_day
 
     init_base_url()
 
     paper_balance         = float(os.environ.get("PAPER_BALANCE", "25.0"))
     _session_start_ts     = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _session_day          = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _session_halted       = False
     session_state         = SessionState.ACTIVE
     recovery_trades       = 0
@@ -1963,9 +2014,14 @@ def main() -> None:
     while not _shutdown_requested:
         try:
             if _session_halted:
-                log.info("Permanently halted — sleeping 1hr.")
-                time.sleep(3600)
-                continue
+                # Halt is paused-for-the-day, not forever: poll often enough to
+                # catch the UTC rollover that clears it (maybe_roll_session_day),
+                # then resume automatically — no redeploy needed.
+                halt_bal = paper_balance if DEMO_MODE else get_live_balance()
+                if not maybe_roll_session_day(halt_bal):
+                    log.info("Halted for the day — paused until UTC rollover.")
+                    time.sleep(300)
+                    continue
 
             if time.time() - last_heartbeat_ts >= 900:
                 last_heartbeat_ts = time.time()
@@ -1997,6 +2053,7 @@ def main() -> None:
                 log.info("Expired locks: %s", expired)
 
             current_balance = paper_balance if DEMO_MODE else get_live_balance()
+            maybe_roll_session_day(current_balance)
             update_session_state(current_balance)
             run_decision(market, current_balance)
 
