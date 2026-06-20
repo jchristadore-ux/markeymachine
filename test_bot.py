@@ -426,6 +426,95 @@ class TestComputeMomentum:
         assert adj == -0.02
 
 
+class TestRegimeAgreement:
+    """The direction gate that blocks betting against the measured trend.
+
+    Backed by 2026-06-19 logs: aligned trade won, both conflicted trades lost.
+    """
+
+    def test_up_favors_yes(self):
+        assert bot.regime_direction(bot.Regime.TRENDING_UP) == "YES"
+
+    def test_down_favors_no(self):
+        assert bot.regime_direction(bot.Regime.TRENDING_DOWN) == "NO"
+
+    def test_ranging_has_no_favored_side(self):
+        assert bot.regime_direction(bot.Regime.RANGING) is None
+
+    def test_yes_in_uptrend_agrees(self):
+        assert bot.regime_agrees(bot.Regime.TRENDING_UP, "YES") is True
+
+    def test_no_in_uptrend_conflicts(self):
+        # Trade 2 (2026-06-19): NO bet in TRENDING_UP — lost.
+        assert bot.regime_agrees(bot.Regime.TRENDING_UP, "NO") is False
+
+    def test_yes_in_downtrend_conflicts(self):
+        # Trade 3 (2026-06-19): YES bet in TRENDING_DOWN — lost.
+        assert bot.regime_agrees(bot.Regime.TRENDING_DOWN, "YES") is False
+
+    def test_no_in_downtrend_agrees(self):
+        assert bot.regime_agrees(bot.Regime.TRENDING_DOWN, "NO") is True
+
+    def test_case_insensitive(self):
+        assert bot.regime_agrees(bot.Regime.TRENDING_UP, "yes") is True
+
+
+class TestBayesianWinProbImbalance:
+    """v9.2.0: order-book strength must move the win probability."""
+
+    def _ob(self, imbalance, depth=2500.0, eff_thresh=0.60):
+        return {"imbalance": imbalance, "total_depth": depth,
+                "eff_thresh": eff_thresh}
+
+    def test_stronger_book_raises_win_prob(self, monkeypatch):
+        monkeypatch.setattr(bot, "_live_prior", 0.635)
+        weak = bot.bayesian_win_prob(
+            self._ob(0.61), "NEUTRAL", 0.0, bot.Regime.TRENDING_UP, 0.78, 0.05)
+        strong = bot.bayesian_win_prob(
+            self._ob(0.90), "NEUTRAL", 0.0, bot.Regime.TRENDING_UP, 0.78, 0.05)
+        assert strong > weak
+
+    def test_imbalance_contribution_is_capped(self, monkeypatch):
+        monkeypatch.setattr(bot, "_live_prior", 0.635)
+        # An extreme imbalance must not blow past the 0.92 hard ceiling.
+        wp = bot.bayesian_win_prob(
+            self._ob(0.999), "AGREE", 0.045, bot.Regime.TRENDING_UP, 0.95, 0.0)
+        assert wp <= 0.92
+
+
+class TestSessionDayRollover:
+    """v9.2.0: the daily halt is paused-for-the-day, not permanent."""
+
+    def setup_method(self):
+        bot._session_day      = "2026-06-19"
+        bot._session_halted   = True
+        bot.session_start_balance  = 2000.0
+        bot.session_stop_threshold = 800.0
+        bot.daily_pnl         = -135.0
+        bot.paper_daily_pnl   = -135.0
+        bot.consecutive_losses = 2
+        bot.session_state     = SessionState.RECOVERY
+        bot.session_traded_tickers.add("KXBTC15M-OLD")
+
+    def test_same_day_is_noop(self, monkeypatch):
+        monkeypatch.setattr(bot, "_session_day",
+                            bot.datetime.now(bot.timezone.utc).strftime("%Y-%m-%d"))
+        bot._session_halted = True
+        assert bot.maybe_roll_session_day(1800.0) is False
+        assert bot._session_halted is True
+
+    def test_new_day_clears_halt_and_rebaselines(self):
+        # setup_method left _session_day at a stale date → rollover fires.
+        rolled = bot.maybe_roll_session_day(1850.0)
+        assert rolled is True
+        assert bot._session_halted is False
+        assert bot.session_start_balance == 1850.0
+        assert bot.daily_pnl == 0.0
+        assert bot.consecutive_losses == 0
+        assert bot.session_state == SessionState.ACTIVE
+        assert "KXBTC15M-OLD" not in bot.session_traded_tickers
+
+
 class TestWilsonCI:
     def test_zero_trades(self):
         pct, lo, hi = bot.wilson_confidence(0, 0)
