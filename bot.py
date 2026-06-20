@@ -715,6 +715,34 @@ def check_ob_trend(ticker: str, direction: str, imbalance: float) -> bool:
     return True
 
 
+def regime_direction(regime: Regime) -> Optional[str]:
+    """Map a trend regime to the contract side it favors.
+
+    For these BTC "above-strike" markets a rising price (TRENDING_UP) settles
+    YES and a falling price (TRENDING_DOWN) settles NO. Non-directional regimes
+    (RANGING/HIGH_VOL/UNKNOWN) return None and never reach this check because
+    run_decision already gates them out.
+    """
+    if regime == Regime.TRENDING_UP:
+        return "YES"
+    if regime == Regime.TRENDING_DOWN:
+        return "NO"
+    return None
+
+
+def regime_agrees(regime: Regime, ob_direction: str) -> bool:
+    """The order-book side must point the same way as the measured trend.
+
+    The single largest source of losses (2026-06-19: both losing trades) was
+    betting the order-book imbalance *against* the regression trend — NO in an
+    uptrend, YES in a downtrend. Order-book imbalance on thin 15-minute crypto
+    markets is a weak, often contrarian signal; the regression trend is the real
+    driver of where price settles. When they conflict, stand aside.
+    """
+    favored = regime_direction(regime)
+    return favored is None or favored == ob_direction.upper()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BAYESIAN PROBABILITY MODEL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1747,6 +1775,14 @@ def run_decision(market: dict, balance: float) -> None:
     ob_dir = ob["direction"]
     if not check_ob_trend(ticker, ob_dir, ob["imbalance"]):
         last_signal_desc = "OB fading"
+        return
+
+    # Direction gate: never bet the order book against the measured trend. Both
+    # of 2026-06-19's losing trades did exactly that (NO in TRENDING_UP, YES in
+    # TRENDING_DOWN) while the one aligned trade won. Require agreement.
+    if not regime_agrees(regime, ob_dir):
+        log.info("Regime conflict │ OB=%s vs %s — no trade", ob_dir, regime.value)
+        last_signal_desc = f"regime conflict OB={ob_dir} {regime.value}"
         return
 
     momentum_verdict, momentum_adj = compute_momentum(ob_dir)

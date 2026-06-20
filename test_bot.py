@@ -426,6 +426,39 @@ class TestComputeMomentum:
         assert adj == -0.02
 
 
+class TestRegimeAgreement:
+    """The direction gate that blocks betting against the measured trend.
+
+    Backed by 2026-06-19 logs: aligned trade won, both conflicted trades lost.
+    """
+
+    def test_up_favors_yes(self):
+        assert bot.regime_direction(bot.Regime.TRENDING_UP) == "YES"
+
+    def test_down_favors_no(self):
+        assert bot.regime_direction(bot.Regime.TRENDING_DOWN) == "NO"
+
+    def test_ranging_has_no_favored_side(self):
+        assert bot.regime_direction(bot.Regime.RANGING) is None
+
+    def test_yes_in_uptrend_agrees(self):
+        assert bot.regime_agrees(bot.Regime.TRENDING_UP, "YES") is True
+
+    def test_no_in_uptrend_conflicts(self):
+        # Trade 2 (2026-06-19): NO bet in TRENDING_UP — lost.
+        assert bot.regime_agrees(bot.Regime.TRENDING_UP, "NO") is False
+
+    def test_yes_in_downtrend_conflicts(self):
+        # Trade 3 (2026-06-19): YES bet in TRENDING_DOWN — lost.
+        assert bot.regime_agrees(bot.Regime.TRENDING_DOWN, "YES") is False
+
+    def test_no_in_downtrend_agrees(self):
+        assert bot.regime_agrees(bot.Regime.TRENDING_DOWN, "NO") is True
+
+    def test_case_insensitive(self):
+        assert bot.regime_agrees(bot.Regime.TRENDING_UP, "yes") is True
+
+
 class TestWilsonCI:
     def test_zero_trades(self):
         pct, lo, hi = bot.wilson_confidence(0, 0)
