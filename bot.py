@@ -1,8 +1,62 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.1.0  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.3.0  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.3.0 — DOCTRINE RESTORE: stop the NEUTRAL-momentum bleed                  ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-20→22 LIVE session, v9.2.0, ~2.7 days):                 ║
+║  - 6 trades fired, ALL on BTC=NEUTRAL. Balance $1586.73 → ~$1396, WR 1/4+.  ║
+║      06-20 08:00 NO @47c  TREND_DOWN  OB70.9% NEUTRAL  Edge"24.5%" $100      ║
+║      06-20 08:30 NO @47c  TREND_DOWN  OB67.3% NEUTRAL  Edge"24.1%" $100 WIN  ║
+║      06-21 08:02 YES@60c  TREND_UP    OB74.4% NEUTRAL  Edge"14.9%" $100 LOSS ║
+║      06-21 08:31 NO @43c  TREND_DOWN  OB88.9% NEUTRAL  Edge"29.4%" $100      ║
+║      06-21 09:00 YES@63c  TREND_UP    OB73.1% NEUTRAL  Edge"11.1%" $100 LOSS ║
+║      06-22 08:32 NO @49c  TREND_DOWN  OB85.7% NEUTRAL  Edge"25.0%" $100 HALT ║
+║                                                                              ║
+║  ROOT CAUSE — three doctrine guards had drifted open (all from the v9.0.6   ║
+║  "throughput" push, retained through v9.2.0). Together they manufacture a    ║
+║  fake 25% edge on what is really a coin flip, then bet the full per-trade    ║
+║  cap on it:                                                                  ║
+║    1. run_decision() had NO NEUTRAL gate. Only CONFLICT was blocked; the     ║
+║       v9.1.0 note "removed the RECOVERY AGREE gate" left ZERO momentum       ║
+║       confirmation in ANY state. Trading on OB alone is doctrine "What This  ║
+║       Bot Will Never Do" item 1 — the exact setup post-mortemed in v6.0.0    ║
+║       (50% loss, 2026-03-27/28).                                            ║
+║    2. NEUTRAL_ACCURACY_DRAG=0.0 → win_prob never discounted flat BTC, so a   ║
+║       coin-flip market scored 0.72–0.75 (logs: mom=-0.000). "Edge" =         ║
+║       win_prob − price was therefore fictional.                            ║
+║    3. compute_confidence() gave NEUTRAL +8 pts. The 06-20 08:30 trade        ║
+║       scored Conf=65 EXACTLY on mom=8.0; at the doctrine value of 2.0 it is  ║
+║       59 < 65 and never trades.                                            ║
+║                                                                              ║
+║  FIX (restore, do not engineer around — zero-trade calm sessions are        ║
+║  CORRECT per the doctrine):                                                 ║
+║    1. momentum_gate_ok(): doctrine Layer 7. REQUIRE_AGREE_MOMENTUM (default  ║
+║       true) rejects NEUTRAL and CONFLICT in EVERY session state. Applied in  ║
+║       run_decision() right after the momentum verdict.                      ║
+║    2. NEUTRAL_ACCURACY_DRAG default 0.0 → 0.02 (honest win_prob if the gate  ║
+║       is ever disabled).                                                     ║
+║    3. compute_confidence(): NEUTRAL 8.0 → 2.0 (doctrine Layer 8: momentum    ║
+║       only scores when AGREE).                                              ║
+║    4. Restore drifted thresholds to doctrine: OB_IMBALANCE_THRESH 0.64→0.70, ║
+║       R2_TREND_THRESHOLD 0.62→0.65, MIN_CONFIDENCE 60→65,                    ║
+║       YES_BREAKEVEN_PRICE 78→67.                                            ║
+║                                                                              ║
+║  The recovery deadlock that justified removing the AGREE gate is ALREADY     ║
+║  solved independently by update_session_state()'s balance-heal exit and     ║
+║  RECOVERY_MAX_SECS wall-clock backstop, so re-blocking NEUTRAL cannot        ║
+║  relock recovery.                                                           ║
+║                                                                              ║
+║  RAILWAY ENV VAR CHANGES REQUIRED (an env override beats these defaults):    ║
+║    - REQUIRE_AGREE_MOMENTUM : set true (or leave unset)                      ║
+║    - NEUTRAL_ACCURACY_DRAG  : set 0.02 (or delete)                          ║
+║    - OB_IMBALANCE_THRESH    : set 0.70 (or delete)                          ║
+║    - R2_TREND_THRESHOLD     : set 0.65 (or delete)                          ║
+║    - MIN_CONFIDENCE         : set 65   (or delete)                          ║
+║    - YES_BREAKEVEN_PRICE    : set 67   (or delete)                          ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.1.0 — RECOVERY DEADLOCK (real fix) + RISK TIGHTENING                     ║
 ║                                                                              ║
 ║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.9, 3.5h slice, ZERO trades):      ║
@@ -15,12 +69,12 @@
 ║    survived at any drawdown that did not pre-heal below the trigger.        ║
 ║                                                                              ║
 ║  FIX (deadlock):                                                            ║
-║  1. Remove the RECOVERY "momentum==AGREE" gate. CONFLICT is already         ║
-║     blocked for every state; allowing NEUTRAL lets recovery trade out at    ║
-║     reduced size so its own exits become reachable.                         ║
-║  2. RECOVERY_MAX_SECS hard timeout in update_session_state() — force back   ║
-║     to ACTIVE if recovery cannot clear in the window. The state machine     ║
-║     can no longer lock permanently, independent of (1).                     ║
+║  1. RECOVERY no longer FORCES momentum==AGREE as a *recovery-only* extra     ║
+║     gate (the doctrine Layer-7 AGREE requirement now applies uniformly to    ║
+║     every state via momentum_gate_ok, so recovery is not special-cased).     ║
+║  2. RECOVERY_MAX_SECS hard timeout in update_session_state() — force back    ║
+║     to ACTIVE if recovery cannot clear in the window. The state machine      ║
+║     can no longer lock permanently.                                        ║
 ║                                                                              ║
 ║  FIX (risk — a normal 1W/4L streak cost 12.5% of bankroll):                 ║
 ║  3. MAX_BET_FRACTION 0.08 → 0.04 (cap a single binary bet at 4% of bank).   ║
@@ -29,100 +83,21 @@
 ║     mis-scaled $15 default can no longer be silently out-scaled.            ║
 ║                                                                              ║
 ║  ─────────────────────────────────────────────────────────────────────     ║
-║  DIAGNOSIS (2026-06-15 LIVE session, v9.0.8, ~3h slice, ZERO trades):       ║
-║  - Portfolio status byte-identical all window:                              ║
-║      $16.30 │ PnL=$-1.43 │ WR=2/4 │ RECOVERY (rec+2)                         ║
-║  - 20 strong directional OB signals generated (up to 99.8% imbalance,       ║
-║    $33k-$149k near-money depth). 18 killed by "Recovery │ AGREE required,    ║
-║    got NEUTRAL", 2 by OB-fade. 0 trades, 0 settlements.                      ║
-║                                                                              ║
-║  Root cause: a self-referential lock. RECOVERY forces momentum==AGREE for   ║
-║  every trade. In a calm market BTC momentum is NEUTRAL on essentially every  ║
-║  scan, so the AGREE gate rejects 100% of signals. update_session_state()'s   ║
-║  ONLY recovery exit was the trade-count path (>=5 trades since entry, WR>=   ║
-║  60%) — but the AGREE gate is what prevents those trades from accumulating.  ║
-║  Recovery needs trades to exit; recovery's own gate blocks the trades. The   ║
-║  counter froze at rec+2 and could never reach 5. Current drawdown had even   ║
-║  healed to ~8% (below the 10% RECOVERY_TRIGGER_PCT) yet stayed locked        ║
-║  because recovery had no balance-based exit.                                 ║
-║                                                                              ║
-║  FIX: update_session_state() now exits RECOVERY when loss_pct recovers to    ║
-║  at/below RECOVERY_TRIGGER_PCT — the exact mirror of the entry condition.    ║
-║  The drawdown that triggered recovery healing is sufficient to return to     ║
-║  ACTIVE regardless of trade count. The trade-count exit is RETAINED as a     ║
-║  faster path when AGREE trades do settle. No edge/Kelly/loss-cap parameter   ║
-║  is loosened — this only fixes an unreachable state-machine exit.            ║
-║                                                                              ║
-║  NOTE: this exits the instant loss_pct is at/below the trigger (symmetric    ║
-║  with entry). If observed to flap on a balance oscillating around the        ║
-║  trigger, tighten the exit to RECOVERY_TRIGGER_PCT * 0.5 for hysteresis.     ║
-║                                                                              ║
-║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.0.8 — PERF-GUARD DEADLOCK FIX (boot-time settlement gate)               ║
+║  Account-wide settlement history was counted toward live W/L with no time   ║
+║  gate, seeding a sub-50% Wilson LB the bot could never escape. _is_post_boot ║
+║  now gates the unmatched-settlement branch to records settled at/after boot. ║
 ║                                                                              ║
-║  DIAGNOSIS (2026-06-11→12 LIVE session, v9.0.7, ~561 scans, ZERO trades):   ║
-║  - PERF GUARD fired 1307×: Wilson LB 30.9% < 50% on every scan.             ║
-║  - Portfolio froze at WR=28/70, 42 consecutive losses, balance flat $9.19.  ║
-║  - The 28W/70L were NOT this session's trades — they were account history.  ║
-║                                                                              ║
-║  Root cause: /portfolio/settlements ignores created_since and returns the   ║
-║  account-wide last 100 settlements. resolve_open_orders()'s unmatched       ║
-║  branch counted ALL of them toward live_wins/live_losses with no time gate  ║
-║  (tickers like -26JUN09… are days old). v9.0.7's _extract_realized_dollars  ║
-║  rewrite made those records yield non-zero PnL (pre-9.0.7 they returned 0   ║
-║  and were dropped), so the leak became active and seeded a sub-50% Wilson   ║
-║  LB the bot could never escape — it can't trade, so it can't recover. The   ║
-║  stale losses also tripped a permanent streak pause.                        ║
-║                                                                              ║
-║  FIX: _is_post_boot(rec) gates the unmatched-settlement branch. A record    ║
-║  counts only if its timestamp >= _session_start_ts. In-flight pre-restart   ║
-║  trades settle AFTER boot and are preserved; account history settled before ║
-║  boot is skipped. Missing/unparseable timestamps are treated as NOT         ║
-║  post-boot (conservative). The 9.0.6 changelog described this gate but it    ║
-║  was never present in the code.                                             ║
-║                                                                              ║
-║  ─────────────────────────────────────────────────────────────────────     ║
-║  v9.0.7 — SETTLEMENT SCHEMA CORRECTED (the critical fix)                     ║
-║                                                                              ║
-║  DIAGNOSIS (2026-06-08 LIVE session, v9.0.5, 1071 scans, 8 trades):         ║
-║  - 8 trades fired, balance $9.46 → $11.60 (+$2.14, ~+23% session).          ║
-║    THE EDGE IS REAL AND PROFITABLE.                                          ║
-║  - But every settlement was DROPPED: WR=0/0, WLB=n/a for the full 11hr      ║
-║    session. The Wilson gate, prior update, and RECOVERY tracking are all    ║
-║    fed by counters that never moved. Profit was invisible to every risk     ║
-║    and sizing system.                                                        ║
-║  - Root cause: the real KXBTC15M settlement record has NO realized_pnl or   ║
-║    profit field. v9.0.6's guessed field names (revenue_dollars, profit)     ║
-║    did not match. Logged record keys are:                                   ║
-║      event_ticker, fee_cost, market_result, no_count_fp,                    ║
-║      no_total_cost_dollars, revenue, settled_time, ticker, value,           ║
-║      yes_count_fp, yes_total_cost_dollars                                    ║
-║                                                                              ║
-║  FIX: _extract_realized_dollars() rewritten against the REAL schema:        ║
+║  v9.0.7 — SETTLEMENT SCHEMA CORRECTED                                        ║
+║  _extract_realized_dollars rewritten against the real KXBTC15M schema:       ║
 ║    pnl = (revenue/100) - yes_total_cost_dollars - no_total_cost_dollars      ║
 ║          - fee_cost                                                           ║
-║  `revenue` is returned in CENTS by Kalshi (same as the balance endpoint);   ║
-║  the *_dollars cost/fee fields are already in dollars.                       ║
-║                                                                              ║
-║  v9.0.6 throughput changes RETAINED (this build supersedes v9.0.6):         ║
-║  1. R2_TREND_THRESHOLD default 0.70 → 0.62                                  ║
-║  2. compute_confidence(): NEUTRAL momentum 2.0 → 8.0 pts                    ║
-║  3. NEUTRAL_ACCURACY_DRAG default 0.02 → 0.0                               ║
-║  4. OB_IMBALANCE_THRESH default → 0.64                                      ║
-║                                                                              ║
-║  RAILWAY ENV VAR CHANGES REQUIRED (if not already applied):                  ║
-║  - OB_IMBALANCE_THRESH: set to 0.64  (logs still show 0.68 — NOT applied)   ║
-║  - R2_TREND_THRESHOLD:  delete or set to 0.62                               ║
-║  - NEUTRAL_ACCURACY_DRAG: delete or set to 0.0                              ║
-║                                                                              ║
-║  v9.0.5 changes preserved: pre-restart settlement W/L counting,             ║
-║  recovery entry snapshot, difference_update, active_tickers global fix.     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "9.2.0"
+BOT_VERSION = "9.3.0"
 
 import base64
 import logging
@@ -242,26 +217,33 @@ MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 1)
 MIN_SAMPLE_TRADES     = _env_int("MIN_SAMPLE_TRADES", 20)
 
 # ── Regime detection ──────────────────────────────────────────────────────────
-# v9.0.6: default lowered from 0.70 → 0.62.
-# At 0.70 only 8.7% of scans qualified; 0.62 targets ~20%.
-# Override via R2_TREND_THRESHOLD env var.
-R2_TREND_THRESHOLD    = _env_float("R2_TREND_THRESHOLD", 0.62)
+# v9.3.0: restored 0.62 → 0.65 (doctrine §8). 0.62 was a v9.0.6 throughput
+# relaxation; at 0.65 about 65% of price variance must be explained by the
+# straight-line fit before the market counts as TRENDING.
+R2_TREND_THRESHOLD    = _env_float("R2_TREND_THRESHOLD", 0.65)
 VOLATILITY_CAP_PCT    = _env_float("VOLATILITY_CAP_PCT", 0.18)
 VOL_CIRCUIT_BREAKER   = _env_float("VOL_CIRCUIT_BREAKER", 0.40)
 TREND_LOOKBACK        = _env_int("TREND_LOOKBACK", 12)
 MIN_PRICES_FOR_REGIME = _env_int("MIN_PRICES_FOR_REGIME", 10)
 
 # ── Signal thresholds ─────────────────────────────────────────────────────────
-# v9.0.6: default lowered from 0.62 → 0.64.
-# Note: if OB_IMBALANCE_THRESH is set to 0.68 in Railway, update it to 0.64.
+# v9.3.0: OB_IMBALANCE_THRESH restored 0.64 → 0.70 (doctrine Layer 6).
+# MIN_CONFIDENCE restored 60 → 65 (doctrine Layer 8). YES_BREAKEVEN_PRICE
+# restored 78 → 67 (doctrine §3 — never pay past mathematical breakeven).
 MIN_OB_DEPTH          = _env_float("MIN_OB_DEPTH_DOLLARS", 75.0)
-OB_IMBALANCE_THRESH   = _env_float("OB_IMBALANCE_THRESH", 0.64)
+OB_IMBALANCE_THRESH   = _env_float("OB_IMBALANCE_THRESH", 0.70)
 MOMENTUM_THRESH_PCT   = _env_float("MOMENTUM_THRESH_PCT", 0.15)
 MIN_EDGE_PCT          = _env_float("MIN_EDGE_PCT", 0.06)
-MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 60)
+MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 65)
 MIN_WIN_PROB          = _env_float("MIN_WIN_PROB", 0.60)
 MIN_MINUTES_TO_EXPIRY = _env_float("MIN_MINUTES_TO_EXPIRY", 6.0)
-YES_BREAKEVEN_PRICE   = _env_int("YES_BREAKEVEN_PRICE", 78)
+YES_BREAKEVEN_PRICE   = _env_int("YES_BREAKEVEN_PRICE", 67)
+
+# v9.3.0: DOCTRINE LAYER 7 — BTC momentum must explicitly AGREE with the OB
+# direction. NEUTRAL (flat BTC) and CONFLICT are both rejections. Default ON.
+# Setting this false re-enables the unconfirmed-OB experiment that produced the
+# 2026-06-20→22 bleed and the 2026-03-27/28 50% loss — only do so deliberately.
+REQUIRE_AGREE_MOMENTUM = _env_bool("REQUIRE_AGREE_MOMENTUM", True)
 
 # ── Time-of-day session quality ───────────────────────────────────────────────
 SESSION_QUALITY: dict = {
@@ -275,10 +257,11 @@ MIN_SESSION_SCORE = _env_int("MIN_SESSION_SCORE", 60)
 # ── Bayesian priors ───────────────────────────────────────────────────────────
 OB_BASE_ACCURACY       = _env_float("OB_BASE_ACCURACY", 0.635)
 MOMENTUM_ACCURACY_LIFT = _env_float("MOMENTUM_ACCURACY_LIFT", 0.045)
-# v9.0.6: default 0.02 → 0.0. NEUTRAL BTC means no evidence against the OB
-# signal — applying a penalty here was suppressing otherwise-valid setups.
-# Delete NEUTRAL_ACCURACY_DRAG env var or set to 0.0 in Railway.
-NEUTRAL_ACCURACY_DRAG  = _env_float("NEUTRAL_ACCURACY_DRAG", 0.0)
+# v9.3.0: restored 0.0 → 0.02. NEUTRAL BTC is NOT "no evidence" for a directional
+# 15-min binary — it means the confirming signal is ABSENT, so the OB-only prior
+# must be discounted. With the Layer-7 gate above, NEUTRAL no longer reaches the
+# win-prob path at all; this keeps win_prob honest if the gate is disabled.
+NEUTRAL_ACCURACY_DRAG  = _env_float("NEUTRAL_ACCURACY_DRAG", 0.02)
 
 # ── Recovery protocol ─────────────────────────────────────────────────────────
 RECOVERY_TRIGGER_PCT  = _env_float("RECOVERY_TRIGGER_PCT", 0.10)
@@ -615,6 +598,28 @@ def compute_momentum(ob_direction: str) -> Tuple[str, float]:
     return "CONFLICT", 0.0
 
 
+def momentum_gate_ok(momentum_verdict: str) -> bool:
+    """DOCTRINE LAYER 7 — the AGREE-required momentum gate.
+
+    A trade requires BTC spot momentum to EXPLICITLY AGREE with the order-book
+    direction. When REQUIRE_AGREE_MOMENTUM is true (default), both CONFLICT and
+    NEUTRAL are rejections.
+
+    NEUTRAL = flat BTC = no directional confirmation. Trading on the order book
+    alone is doctrine "What This Bot Will Never Do" item 1 — the exact setup
+    post-mortemed in v6.0.0 (50% loss, 2026-03-27/28) and the cause of the
+    2026-06-20→22 bleed, in which all 6 trades fired on BTC=NEUTRAL.
+
+    Applies in EVERY session state. RECOVERY is not exempt: its deadlock is
+    resolved by update_session_state()'s balance-heal exit and RECOVERY_MAX_SECS
+    wall-clock backstop, not by trading unconfirmed setups. A calm, all-NEUTRAL
+    session producing zero trades is correct behaviour.
+    """
+    if not REQUIRE_AGREE_MOMENTUM:
+        return True
+    return momentum_verdict == "AGREE"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ORDER BOOK ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -816,12 +821,12 @@ def compute_confidence(
     if regime in (Regime.TRENDING_UP, Regime.TRENDING_DOWN):
         regime_pts += min(5.0, (r_squared - R2_TREND_THRESHOLD) * 15.0)
 
-    # v9.0.6: NEUTRAL raised from 2.0 → 8.0.
-    # NEUTRAL BTC means no evidence against the OB signal.
-    # A 2pt score (vs AGREE's 15) imposed a ~13pt penalty on setups where BTC
-    # happens to be flat — killing 9/10 signals in the 2026-06-08 session.
-    # AGREE still wins decisively (15 vs 8). CONFLICT unchanged (-20).
-    momentum_map = {"AGREE": 15.0, "NEUTRAL": 8.0, "CONFLICT": -20.0}
+    # v9.3.0: NEUTRAL restored 8.0 → 2.0 (doctrine Layer 8: BTC momentum "only
+    # counts if AGREE"). The v9.0.6 bump to 8.0 was the third leg of the
+    # NEUTRAL bleed: the 2026-06-20 08:30 trade scored Conf=65 EXACTLY on
+    # mom=8.0; at 2.0 it is 59 < 65 and never trades. With momentum_gate_ok
+    # this is belt-and-suspenders, but it keeps the score truthful.
+    momentum_map = {"AGREE": 15.0, "NEUTRAL": 2.0, "CONFLICT": -20.0}
     momentum_pts = momentum_map.get(momentum_verdict, 0.0)
 
     prob_pts = max(0.0, (win_prob - 0.50) / 0.42 * 15.0)
@@ -985,15 +990,11 @@ def update_session_state(current_balance: float) -> None:
             )
             return
 
-        # v9.0.9: BALANCE-BASED EXIT (primary).
-        # Recovery entry is gated on loss_pct > RECOVERY_TRIGGER_PCT; the exit
-        # must be reachable the same way. The trade-count exit below deadlocks
-        # in calm markets — RECOVERY forces momentum==AGREE, BTC momentum is
-        # NEUTRAL on most scans, so trades never accumulate and recovery never
-        # clears (2026-06-15 session: 18 strong OB signals rejected, counter
-        # frozen at rec+2, 0 trades for hours). If the drawdown that triggered
-        # recovery has healed back to at/below the trigger, return to ACTIVE
-        # regardless of trade count. No edge/Kelly/loss-cap parameter loosened.
+        # v9.0.9: BALANCE-BASED EXIT (primary). Recovery entry is gated on
+        # loss_pct > RECOVERY_TRIGGER_PCT; the exit must be reachable the same
+        # way. If the drawdown that triggered recovery has healed back to
+        # at/below the trigger, return to ACTIVE regardless of trade count. No
+        # edge/Kelly/loss-cap parameter loosened.
         if loss_pct <= RECOVERY_TRIGGER_PCT:
             session_state = SessionState.ACTIVE
             log.info("RECOVERY EXITED │ drawdown healed (loss %.1f%% ≤ trigger %.1f%%)",
@@ -1686,6 +1687,8 @@ def telegram_boot(balance: float) -> None:
         f"DailyLoss≤${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}\n"
         f"MinConf={MIN_CONFIDENCE} | MinWinP={MIN_WIN_PROB*100:.0f}% | R²≥{R2_TREND_THRESHOLD}\n"
         f"OBDepth≥${MIN_OB_DEPTH:.0f} | OBImb≥{OB_IMBALANCE_THRESH*100:.0f}%\n"
+        f"AGREE-gate={'ON' if REQUIRE_AGREE_MOMENTUM else 'OFF'} | "
+        f"Breakeven≤{YES_BREAKEVEN_PRICE}c\n"
         f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}"
     )
 
@@ -1801,16 +1804,22 @@ def run_decision(market: dict, balance: float) -> None:
         last_signal_desc = f"CONFLICT OB={ob_dir}"
         return
 
-    # v9.1.0: the old "RECOVERY requires momentum==AGREE" gate is removed. It was
-    # a self-referential lock: in a calm market momentum is NEUTRAL on nearly
-    # every scan, so 100% of recovery signals were rejected, no trades could
-    # accumulate, and neither recovery exit (trade-count or balance-heal) was
-    # reachable — the bot froze in RECOVERY indefinitely (2026-06-18: 3.5h, 0
-    # trades). CONFLICT is already blocked for every state above; allowing
-    # NEUTRAL lets recovery trade its way out at reduced size (KELLY_RECOVERY_MULT)
-    # while every other safety gate (regime, OB dominance, win-prob, confidence,
-    # edge) still applies. RECOVERY_MAX_SECS in update_session_state() is the
-    # hard backstop against any residual lock.
+    # ── DOCTRINE LAYER 7 (restored v9.3.0) ───────────────────────────────────
+    # BTC spot momentum must EXPLICITLY AGREE with the order-book direction.
+    # NEUTRAL (flat BTC) is not confirmation; trading on the order book alone is
+    # the single condition this bot was post-mortemed never to do (v6.0.0;
+    # 2026-03-27/28 50% loss). Every trade in the 2026-06-20→22 bleed fired on
+    # BTC=NEUTRAL because v9.0.6→v9.2.0 left no NEUTRAL gate here.
+    #
+    # Applies in EVERY session state, RECOVERY included. RECOVERY does not relax
+    # this — its deadlock is resolved by the balance-heal exit and
+    # RECOVERY_MAX_SECS in update_session_state(), not by trading unconfirmed
+    # setups. A calm, all-NEUTRAL session producing zero trades is CORRECT.
+    if not momentum_gate_ok(momentum_verdict):
+        log.info("Momentum │ require AGREE, got %s (OB=%s) — no trade",
+                 momentum_verdict, ob_dir)
+        last_signal_desc = f"momentum {momentum_verdict} (need AGREE)"
+        return
 
     win_prob = bayesian_win_prob(ob, momentum_verdict, momentum_adj,
                                   regime, r_squared, realized_vol)
@@ -1974,6 +1983,9 @@ def main() -> None:
              R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
     log.info("  OB depth≥$%.0f imb≥%.0f%% | WinP≥%.0f%% Edge≥%.0f%%",
              MIN_OB_DEPTH, OB_IMBALANCE_THRESH * 100, MIN_WIN_PROB * 100, MIN_EDGE_PCT * 100)
+    log.info("  AGREE-gate=%s | MinConf=%d | Breakeven≤%dc | NEUTRALdrag=%.3f",
+             "ON" if REQUIRE_AGREE_MOMENTUM else "OFF",
+             MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
     log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d",
              KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
     log.info("━" * 70)
