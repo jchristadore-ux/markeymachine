@@ -1,4 +1,4 @@
-# Johnny5-Kalshi-Auto v5.3.0
+# MarkeyMachine v5.3.0
 
 > Production quant bot for Kalshi 15-minute BTC up/down prediction markets.
 > Near-money order book pressure + BTC momentum confirmation + fractional Kelly sizing.

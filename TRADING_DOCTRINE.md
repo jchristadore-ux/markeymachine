@@ -1,4 +1,4 @@
-# TRADING DOCTRINE — Johnny5-Kalshi-Auto v6.0.0
+# TRADING DOCTRINE — MarkeyMachine v6.0.0
 
 > "A patient quantitative trader who waits all day for one unfair opportunity."
 >

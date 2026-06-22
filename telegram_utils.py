@@ -1,5 +1,5 @@
 """
-telegram_utils.py — Telegram notification module for Johnny5-Kalshi-Auto
+telegram_utils.py — Telegram notification module for MarkeyMachine
 
 Responsibilities:
   - Validate credentials at startup
@@ -20,7 +20,7 @@ from typing import Optional
 
 import requests
 
-log = logging.getLogger("Johnny5.telegram")
+log = logging.getLogger("MarkeyMachine.telegram")
 
 # ── Module state ──────────────────────────────────────────────────────────────
 _telegram_enabled: bool = False
@@ -45,7 +45,7 @@ def validate_telegram_connection() -> bool:
     _bot_token = token
     _chat_id   = chat
 
-    ok = _send_raw("🤖 Johnny5 connected to Telegram.\nCredentials validated ✅ — alerts active.")
+    ok = _send_raw("🤖 MarkeyMachine connected to Telegram.\nCredentials validated ✅ — alerts active.")
 
     if ok:
         log.info("✅ Telegram validated — notifications enabled.")

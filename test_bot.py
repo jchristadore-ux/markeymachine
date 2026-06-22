@@ -1,5 +1,5 @@
 """
-test_bot.py — Pytest suite for Johnny5-Kalshi-Auto v9.3.0
+test_bot.py — Pytest suite for MarkeyMachine v9.3.0
 
 Covers:
   P0: All risk controls

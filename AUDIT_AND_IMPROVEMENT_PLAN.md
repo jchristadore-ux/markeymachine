@@ -1,4 +1,4 @@
-# Johnny5-Kalshi-Auto — v5.2.1 Audit & Improvement Plan
+# MarkeyMachine — v5.2.1 Audit & Improvement Plan
 
 > Produced 2026-03-26. Covers `bot.py`, `telegram_utils.py`, `requirements.txt`, `railway.toml`.
 
@@ -153,7 +153,7 @@ Every paper win shows zero profit instead of the real gain. Over a session this 
 Paste this into Claude each week to continuously improve the bot:
 
 ```
-You are auditing Johnny5-Kalshi-Auto, a Python trading bot for Kalshi BTC 15-minute
+You are auditing MarkeyMachine, a Python trading bot for Kalshi BTC 15-minute
 prediction markets. The bot runs on Railway and trades via the Kalshi REST API.
 
 Here are the current files: [attach bot.py, telegram_utils.py, requirements.txt, railway.toml]

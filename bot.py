@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.3.0  —  Production Build                          ║
+║  MARKEYMACHINE  v9.3.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.3.0 — DOCTRINE RESTORE: stop the NEUTRAL-momentum bleed                  ║
@@ -127,7 +127,7 @@ logging.basicConfig(
     format="%(asctime)s │ %(levelname)-8s │ %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("Johnny5")
+log = logging.getLogger("MarkeyMachine")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1595,7 +1595,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
         log.info("Order │ 0 contracts at $%.2f @ %dc", bet_dollars, limit_cents)
         return None
     cost      = (limit_cents * count) / 100.0
-    client_id = f"j5-{uuid.uuid4().hex[:10]}"
+    client_id = f"mm-{uuid.uuid4().hex[:10]}"
     btc_entry = list(btc_prices)[-1] if btc_prices else 0
 
     if DEMO_MODE:
@@ -1681,7 +1681,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
 def telegram_boot(balance: float) -> None:
     mode = "📋 PAPER" if DEMO_MODE else "🔴 LIVE"
     tg.send_telegram_message(
-        f"🤖 Johnny5 {BOT_VERSION} STARTED\n"
+        f"🤖 MarkeyMachine {BOT_VERSION} STARTED\n"
         f"{mode} │ State: {session_state.value}\n"
         f"Balance: ${balance:.2f}\n"
         f"DailyLoss≤${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}\n"
@@ -1977,7 +1977,7 @@ def main() -> None:
     _processed_settlement_ids.clear()
 
     log.info("━" * 70)
-    log.info("  JOHNNY5 %s │ %s", BOT_VERSION, "PAPER 🟡" if DEMO_MODE else "LIVE 🔴")
+    log.info("  MARKEYMACHINE %s │ %s", BOT_VERSION, "PAPER 🟡" if DEMO_MODE else "LIVE 🔴")
     log.info("  Start: %s", _session_start_ts)
     log.info("  Regime R²≥%.2f | VolCap=%.3f%% | Circuit=%.2f%%",
              R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
@@ -2006,11 +2006,11 @@ def main() -> None:
             bal = get_live_balance(allow_cached_zero=False)
         except Exception as e:
             log.error("Cannot fetch starting balance — aborting: %s", e)
-            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance error")
+            tg.send_telegram_message(f"🛑 MarkeyMachine {BOT_VERSION} boot failed: balance error")
             return
         if bal <= 0.0:
             log.error("Starting balance $0 — aborting")
-            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance=$0")
+            tg.send_telegram_message(f"🛑 MarkeyMachine {BOT_VERSION} boot failed: balance=$0")
             return
         _last_known_balance    = bal
         session_start_balance  = bal
@@ -2110,7 +2110,7 @@ def main() -> None:
 
     final = paper_balance if DEMO_MODE else get_live_balance()
     log.info("Shutdown. Final balance: $%.2f", final)
-    tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} stopped. Final: ${final:.2f}")
+    tg.send_telegram_message(f"🛑 MarkeyMachine {BOT_VERSION} stopped. Final: ${final:.2f}")
 
 
 if __name__ == "__main__":

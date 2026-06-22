@@ -1,5 +1,5 @@
 """
-ladder.py — Dynamic laddering stake manager for Johnny5-Kalshi-Auto.
+ladder.py — Dynamic laddering stake manager for MarkeyMachine.
 
 PURPOSE
 -------
@@ -41,7 +41,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
 
-log = logging.getLogger("Johnny5.ladder")
+log = logging.getLogger("MarkeyMachine.ladder")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
