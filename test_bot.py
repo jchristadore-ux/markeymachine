@@ -1,11 +1,12 @@
 """
-test_bot.py — Pytest suite for Johnny5-Kalshi-Auto v9.0.1
+test_bot.py — Pytest suite for Johnny5-Kalshi-Auto v9.3.0
 
 Covers:
   P0: All risk controls
   P1: Signal math (edge, Kelly, momentum, confidence, regime)
   P2: OB analysis, stale cancel, ob trend
   P3: Wilson CI, performance guard, Bayesian prior
+  v9.3.0: doctrine Layer-7 AGREE gate, NEUTRAL confidence weight, restored thresholds
 
 Usage:
   pip install pytest
@@ -117,6 +118,85 @@ class TestPostBootSettlementGate:
     def test_no_boot_ts_excluded(self):
         bot._session_start_ts = ""
         assert bot._is_post_boot({"settled_time": "2026-06-11T23:45:00Z"}) is False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v9.3.0: DOCTRINE LAYER 7 — AGREE-REQUIRED MOMENTUM GATE
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestMomentumGate:
+    """The single fix for the 2026-06-20→22 bleed: NEUTRAL momentum must NOT
+    trade. All 6 bleeding trades fired on BTC=NEUTRAL because no gate existed."""
+
+    def test_agree_passes_when_required(self, monkeypatch):
+        monkeypatch.setattr(bot, "REQUIRE_AGREE_MOMENTUM", True)
+        assert bot.momentum_gate_ok("AGREE") is True
+
+    def test_neutral_blocked_when_required(self, monkeypatch):
+        # This is the bleed. NEUTRAL must be rejected by default.
+        monkeypatch.setattr(bot, "REQUIRE_AGREE_MOMENTUM", True)
+        assert bot.momentum_gate_ok("NEUTRAL") is False
+
+    def test_conflict_blocked_when_required(self, monkeypatch):
+        monkeypatch.setattr(bot, "REQUIRE_AGREE_MOMENTUM", True)
+        assert bot.momentum_gate_ok("CONFLICT") is False
+
+    def test_gate_off_allows_neutral(self, monkeypatch):
+        # Escape hatch for the deliberate unconfirmed-OB experiment only.
+        monkeypatch.setattr(bot, "REQUIRE_AGREE_MOMENTUM", False)
+        assert bot.momentum_gate_ok("NEUTRAL") is True
+
+    def test_default_is_on(self):
+        # The doctrine default must be ON so an unset env var is safe.
+        assert bot.REQUIRE_AGREE_MOMENTUM is True
+
+
+class TestConfidenceNeutralWeight:
+    """v9.3.0: NEUTRAL momentum restored to 2 pts (doctrine Layer 8). The
+    v9.0.6 bump to 8 pts lifted marginal flat-BTC setups over the 65 bar."""
+
+    def _ob(self, imbalance=0.71, depth=34000.0, eff_thresh=0.66):
+        return {"imbalance": imbalance, "total_depth": depth,
+                "eff_thresh": eff_thresh}
+
+    def test_neutral_scores_less_than_agree(self):
+        common = dict(ob=self._ob(), regime=Regime.TRENDING_DOWN, r_squared=0.82,
+                      win_prob=0.72, mins_remaining=14.0, session_score=60)
+        neutral = bot.compute_confidence(momentum_verdict="NEUTRAL", **common)
+        agree   = bot.compute_confidence(momentum_verdict="AGREE", **common)
+        assert agree - neutral == pytest.approx(13.0, abs=0.01)  # 15 vs 2
+
+    def test_06_20_0830_trade_now_blocked(self, monkeypatch):
+        """Reproduce the 06-20 08:30 trade that scored Conf=65 on mom=8.0.
+        With NEUTRAL=2 it must fall below the restored MIN_CONFIDENCE=65."""
+        monkeypatch.setattr(bot, "MIN_CONFIDENCE", 65)
+        # Approximate the logged components: imb≈4.5 depth≈10.9 regime≈23.8
+        # prob≈7.9 time≈10.0 → with NEUTRAL=8 these summed to 65.
+        conf = bot.compute_confidence(
+            ob=self._ob(imbalance=0.673, depth=31053.0, eff_thresh=0.66),
+            regime=Regime.TRENDING_DOWN, r_squared=0.87,
+            momentum_verdict="NEUTRAL", win_prob=0.721,
+            mins_remaining=14.1, session_score=60)
+        assert conf < 65
+
+
+class TestRestoredThresholds:
+    """v9.3.0: the four drifted defaults are back at doctrine values."""
+
+    def test_ob_imbalance_threshold(self):
+        assert bot.OB_IMBALANCE_THRESH == 0.70
+
+    def test_r2_trend_threshold(self):
+        assert bot.R2_TREND_THRESHOLD == 0.65
+
+    def test_min_confidence(self):
+        assert bot.MIN_CONFIDENCE == 65
+
+    def test_yes_breakeven_price(self):
+        assert bot.YES_BREAKEVEN_PRICE == 67
+
+    def test_neutral_drag_restored(self):
+        assert bot.NEUTRAL_ACCURACY_DRAG == 0.02
 
 
 # ═════════════════════════════════════════════════════════════════════════════
