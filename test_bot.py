@@ -520,13 +520,17 @@ class TestComputeMomentum:
     def setup_method(self):
         bot.btc_prices.clear()
 
-    def test_insufficient_data(self):
+    def test_insufficient_data(self, monkeypatch):
+        # v9.3.2: with the default lookback (6) a single price is far short of
+        # the MOMENTUM_LOOKBACK+1 samples needed.
         bot.btc_prices.append(50000)
         verdict, adj = bot.compute_momentum("YES")
         assert verdict == "NEUTRAL"
 
     def test_agree_yes_btc_up(self, monkeypatch):
+        # 4-price series exercises the 3-interval window; pin lookback to 3.
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
         for p in [50000, 50050, 50100, 50200, 50300]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
@@ -535,6 +539,7 @@ class TestComputeMomentum:
 
     def test_conflict_yes_btc_down(self, monkeypatch):
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
         for p in [50000, 49900, 49800, 49700, 49500]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
@@ -542,6 +547,7 @@ class TestComputeMomentum:
 
     def test_neutral_flat(self, monkeypatch):
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
         for p in [50000, 50010, 50020, 50030, 50040]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
@@ -549,6 +555,7 @@ class TestComputeMomentum:
 
     def test_agree_no_btc_down(self, monkeypatch):
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
         for p in [50000, 49900, 49800, 49700, 49500]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("NO")
@@ -556,11 +563,42 @@ class TestComputeMomentum:
 
     def test_neutral_adj_is_negative(self, monkeypatch):
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
         monkeypatch.setattr(bot, "NEUTRAL_ACCURACY_DRAG", 0.02)
         for p in [50000, 50010, 50020, 50030, 50040]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
         assert adj == -0.02
+
+    def test_lookback_default_needs_more_samples(self, monkeypatch):
+        # v9.3.2 regression: at the default lookback (6) a 5-price series is one
+        # sample short, so momentum cannot yet be measured.
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
+        for p in [50000, 50050, 50100, 50200, 50300]:
+            bot.btc_prices.append(p)
+        verdict, adj = bot.compute_momentum("YES")
+        assert verdict == "NEUTRAL"
+
+    def test_gentle_trend_now_agrees(self, monkeypatch):
+        # v9.3.2 regression for the 2026-06-23 "zero trades" bug. A clean,
+        # gentle ~0.3% uptrend over 12 samples (~6 min) in which NO single
+        # 90s/3-sample slice moves ≥0.15% used to read NEUTRAL and block every
+        # trade. With the default 6-interval lookback the wider window clears
+        # the 0.15% threshold and momentum correctly AGREES.
+        monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
+        # +25/step → +0.05% per 90s slice (< thresh), but +0.30% over 6 slices.
+        prices = [50000 + 25 * i for i in range(12)]
+        for p in prices:
+            bot.btc_prices.append(p)
+        # old 3-sample window would have been NEUTRAL...
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
+        assert bot.compute_momentum("YES")[0] == "NEUTRAL"
+        # ...new 6-sample window AGREES on the same data.
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
+        verdict, adj = bot.compute_momentum("YES")
+        assert verdict == "AGREE"
+        assert adj > 0
 
 
 class TestRegimeAgreement:
