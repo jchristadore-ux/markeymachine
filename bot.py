@@ -1,7 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.3.1  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.3.2  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.3.2 — MOMENTUM WINDOW FIX: the AGREE gate was unsatisfiable, 0 trades.   ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-23 LIVE session, v9.3.1): ZERO trades fired all day.     ║
+║  - compute_regime() flags TRENDING over TREND_LOOKBACK=12 samples (~6 min,   ║
+║    R²≥0.65). compute_momentum() measured BTC over only prices[-1] vs [-4] —  ║
+║    3 samples (~90s) — and required |move|≥0.15%. A clean ~6-min trend almost ║
+║    never has a single 90s slice ≥0.15%, so momentum read NEUTRAL and the     ║
+║    v9.3.0 AGREE gate rejected every setup.                                   ║
+║  - Logs: 34 cycles had OB depth aligned with a real trend; momentum returned ║
+║    NEUTRAL on ALL of them, AGREE/CONFLICT zero times. The gate was a wall.   ║
+║                                                                              ║
+║  FIX: momentum lookback is now MOMENTUM_LOOKBACK (default 6 ≈ 3 min), env-   ║
+║  tunable. A genuine multi-minute trend now yields AGREE; flat BTC still      ║
+║  reads NEUTRAL, so the doctrine intent ("never trade flat BTC") is intact —  ║
+║  only the timescale momentum is measured over changed. Set MOMENTUM_LOOKBACK ║
+║  =3 to restore the old window. MOMENTUM_THRESH_PCT (0.15%) unchanged.        ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.3.1 — PHANTOM DAILY-LOSS FIX: open-position cash outlay halted on a WIN  ║
 ║                                                                              ║
@@ -138,7 +155,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.3.1"
+BOT_VERSION = "9.3.2"
 
 import base64
 import logging
@@ -274,6 +291,13 @@ MIN_PRICES_FOR_REGIME = _env_int("MIN_PRICES_FOR_REGIME", 10)
 MIN_OB_DEPTH          = _env_float("MIN_OB_DEPTH_DOLLARS", 75.0)
 OB_IMBALANCE_THRESH   = _env_float("OB_IMBALANCE_THRESH", 0.70)
 MOMENTUM_THRESH_PCT   = _env_float("MOMENTUM_THRESH_PCT", 0.15)
+# v9.3.2: momentum lookback (intervals back). The old fixed 3-sample (~90s)
+# window measured a far shorter horizon than the regime's TREND_LOOKBACK (~6 min)
+# trend it was meant to confirm, so genuine trends read NEUTRAL and the AGREE
+# gate blocked EVERY trade (2026-06-23: 0 trades all day). ~6 intervals (~3 min
+# at the 30s poll) confirms real trends without firing on 90s chop. Set to 3 to
+# restore the pre-9.3.2 window.
+MOMENTUM_LOOKBACK     = _env_int("MOMENTUM_LOOKBACK", 6)
 MIN_EDGE_PCT          = _env_float("MIN_EDGE_PCT", 0.06)
 MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 65)
 MIN_WIN_PROB          = _env_float("MIN_WIN_PROB", 0.60)
@@ -617,12 +641,12 @@ def check_vol_circuit() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_momentum(ob_direction: str) -> Tuple[str, float]:
-    if len(btc_prices) < 5:
+    if len(btc_prices) < MOMENTUM_LOOKBACK + 1:
         return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
 
     prices  = list(btc_prices)
     recent  = prices[-1]
-    earlier = prices[-4]
+    earlier = prices[-(MOMENTUM_LOOKBACK + 1)]
     if earlier <= 0:
         return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
 
@@ -2040,6 +2064,8 @@ def main() -> None:
     log.info("  AGREE-gate=%s | MinConf=%d | Breakeven≤%dc | NEUTRALdrag=%.3f",
              "ON" if REQUIRE_AGREE_MOMENTUM else "OFF",
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
+    log.info("  Momentum lookback=%d intervals | thresh≥%.2f%%",
+             MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT)
     log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d",
              KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
     log.info("━" * 70)
