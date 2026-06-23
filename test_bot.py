@@ -1,5 +1,5 @@
 """
-test_bot.py — Pytest suite for MarkeyMachine v9.3.0
+test_bot.py — Pytest suite for MarkeyMachine v9.3.1
 
 Covers:
   P0: All risk controls
@@ -297,6 +297,63 @@ class TestDailyLossCheck:
         # pct cap ($1.20) is tighter than $15 here, so it binds first
         monkeypatch.setattr(bot, "paper_daily_pnl", -2.0)
         assert bot.daily_loss_check(18.0) is False
+
+
+class TestLiveRealizedDailyLoss:
+    """v9.3.1: the LIVE daily-loss breaker must read realized-only PnL, never the
+    balance−start cash delta. Reproduces the 2026-06-23 incident where a winning
+    trade's open-position cash outlay ($99.71) halted the bot before settlement."""
+
+    def setup_method(self):
+        bot._session_halted = False
+
+    def test_open_position_cash_outlay_does_not_halt(self, monkeypatch):
+        # LIVE mode. Session started at $1477.74; cap = 6% = $88.66.
+        monkeypatch.setattr(bot, "DEMO_MODE", False)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
+        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        # Position is OPEN: nothing settled, so realized = 0 even though the
+        # broker balance is down by the $99.71 cash outlay.
+        monkeypatch.setattr(bot, "live_daily_realized", 0.0)
+        # balance passed in reflects the cash debit; the breaker must ignore it.
+        assert bot.daily_loss_check(1378.03) is True
+        assert bot._session_halted is False
+
+    def test_realized_win_keeps_trading(self, monkeypatch):
+        monkeypatch.setattr(bot, "DEMO_MODE", False)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
+        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        # The trade settled +$69.29 (the real outcome on 2026-06-23).
+        monkeypatch.setattr(bot, "live_daily_realized", 69.29)
+        assert bot.daily_loss_check(1547.03) is True
+        assert bot._session_halted is False
+
+    def test_genuine_realized_loss_still_halts(self, monkeypatch):
+        # The breaker must still fire on a REAL realized drawdown past the cap.
+        monkeypatch.setattr(bot, "DEMO_MODE", False)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
+        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        monkeypatch.setattr(bot, "live_daily_realized", -90.0)  # > $88.66 cap
+        assert bot.daily_loss_check(1387.74) is False
+        assert bot._session_halted is True
+
+    def test_breaker_ignores_balance_delta_in_live(self, monkeypatch):
+        # Even a catastrophic-looking balance dip must not halt when realized PnL
+        # is still within cap (e.g. multiple open positions mid-flight).
+        monkeypatch.setattr(bot, "DEMO_MODE", False)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
+        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        monkeypatch.setattr(bot, "live_daily_realized", -10.0)  # within cap
+        assert bot.daily_loss_check(1100.00) is True  # huge cash dip, ignored
+        assert bot._session_halted is False
 
 
 class TestSpreadCheck:
