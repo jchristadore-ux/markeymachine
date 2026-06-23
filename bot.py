@@ -1,8 +1,49 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.3.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.3.1  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.3.1 — PHANTOM DAILY-LOSS FIX: open-position cash outlay halted on a WIN  ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-23 LIVE session, v9.3.0, single trade):                 ║
+║  - 08:15:23 ORDER  NO -26JUN230430-30  169 @ 59c  $100.00  (cost $99.71).   ║
+║    Fully doctrine-clean entry: TREND_DOWN R²=0.751, OB=74.2%, BTC=AGREE,    ║
+║    Conf=68, WinP=78.9%. Exactly the kind of trade the doctrine permits.     ║
+║  - 08:16:25 Portfolio  $1378.03  PnL=$-99.71  WR=0/0  — i.e. the open       ║
+║    position's CASH OUTLAY (169 × $0.59 = $99.71) was reported as daily PnL  ║
+║    while nothing had settled. Kalshi debits contract cost at fill, so       ║
+║    (balance − session_start_balance) reads as a full-stake loss until the   ║
+║    payout returns at settlement.                                           ║
+║  - 08:30:30 DAILY LOSS  $99.71 ≥ cap $88.66 — halted.  (cap = 6% of equity, ║
+║    which is CORRECT; the input was wrong.)                                  ║
+║  - 08:30:31 SETTLED  WIN  +$69.29  WR=1/1.  The trade WON. The halt had     ║
+║    latched one second earlier off the pre-settlement cash mark, then idled  ║
+║    the bot until UTC rollover (~4.5h, 56 halt log lines).                   ║
+║                                                                              ║
+║  ROOT CAUSE — the LIVE daily-loss circuit breaker consumed an UNREALIZED    ║
+║  cash-balance delta, not realized PnL. An open position is cash-out / zero- ║
+║  marked, so any single in-flight trade ≥ the daily cap trips the breaker    ║
+║  before it can settle. This is the mirror image of the v9.3.0 phantom-WIN   ║
+║  fix in _extract_realized_dollars: same class of defect (unreconciled mark  ║
+║  treated as realized), opposite sign.                                      ║
+║                                                                              ║
+║  FIX (accounting only — NO guardrail was loosened):                        ║
+║    1. New accumulator live_daily_realized; resolve_open_orders() adds the   ║
+║       reconciled _extract_realized_dollars() result of each MATCHED settled ║
+║       trade to it. Open/unsettled positions contribute 0.                  ║
+║    2. daily_loss_check() reads live_daily_realized in LIVE mode (was the    ║
+║       balance−start cash delta). DEMO path (paper_daily_pnl) was already    ║
+║       realized-only and unchanged.                                         ║
+║    3. live_daily_realized resets with daily_pnl on UTC rollover and boot.   ║
+║    4. Portfolio/heartbeat lines now report realized PnL as the PnL figure   ║
+║       and show the cash delta separately as "cash=", so an open position    ║
+║       can never again look like a daily loss in the logs.                  ║
+║                                                                              ║
+║  The 6% daily cap, $-dollar cap, SESSION_STOP_FRACTION, MAX_CONSEC_LOSSES,  ║
+║  the AGREE/NEUTRAL gate, and OB/R²/confidence thresholds are UNCHANGED.     ║
+║  No Railway env var changes are required for this fix.                     ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.3.0 — DOCTRINE RESTORE: stop the NEUTRAL-momentum bleed                  ║
 ║                                                                              ║
 ║  DIAGNOSIS (2026-06-20→22 LIVE session, v9.2.0, ~2.7 days):                 ║
@@ -97,7 +138,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.3.0"
+BOT_VERSION = "9.3.1"
 
 import base64
 import logging
@@ -399,6 +440,7 @@ consecutive_losses:     int   = 0
 streak_pause_until:     float = 0.0
 running_pnl:            float = 0.0
 daily_pnl:              float = 0.0
+live_daily_realized:    float = 0.0   # v9.3.1: realized-only $ that feeds the LIVE daily-loss breaker
 last_trade_ts:          float = -9999.0
 last_heartbeat_ts:      float = 0.0
 last_daily_summary_ts:  float = 0.0
@@ -1187,6 +1229,7 @@ def _fetch_settled_records(since_ts: str) -> list:
 def resolve_open_orders() -> None:
     global paper_balance, paper_daily_pnl, consecutive_losses
     global running_pnl, live_wins, live_losses, streak_pause_until
+    global live_daily_realized
 
     if not open_orders and not DEMO_MODE:
         pass
@@ -1357,7 +1400,13 @@ def resolve_open_orders() -> None:
 
             balance        = get_live_balance()
             running_pnl   += pnl
-            live_daily_pnl = balance - session_start_balance
+            # v9.3.1: realized-only daily accumulator for the daily-loss breaker.
+            # `pnl` is the reconciled _extract_realized_dollars() result for a
+            # MATCHED, SETTLED trade — never an open-position mark.
+            live_daily_realized += pnl
+            # Display value for Telegram alerts: report the realized daily total
+            # (same figure the breaker uses), not the cash-balance delta.
+            live_daily_pnl = live_daily_realized
 
             if won:
                 consecutive_losses = 0
@@ -1520,7 +1569,11 @@ def daily_loss_check(balance: float) -> bool:
     global _session_halted
     if _session_halted:
         return False
-    pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
+    # v9.3.1: LIVE mode now reads realized-only PnL (live_daily_realized), NOT
+    # (balance − session_start_balance). The cash delta counts an open position's
+    # outlay as a loss the instant it fills, which halted a WINNING trade on
+    # 2026-06-23. An unsettled position must contribute 0 to this guard.
+    pnl = paper_daily_pnl if DEMO_MODE else live_daily_realized
     # v9.1.0: halt on the tighter of the fixed dollar cap and a percentage of the
     # session-start balance. The $15 default never bound on a ~$1969 bankroll, so
     # a cold streak ran to −$246.87 (12.5%) before RECOVERY froze it.
@@ -1915,7 +1968,7 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     """
     global _session_day, _session_halted, session_start_balance
     global session_stop_threshold, daily_pnl, paper_daily_pnl, consecutive_losses
-    global session_state, streak_pause_until
+    global session_state, streak_pause_until, live_daily_realized
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today == _session_day:
@@ -1928,6 +1981,7 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     session_stop_threshold = current_balance * SESSION_STOP_FRACTION
     daily_pnl              = 0.0
     paper_daily_pnl        = 0.0
+    live_daily_realized    = 0.0
     consecutive_losses     = 0
     streak_pause_until     = 0.0
     session_state          = SessionState.ACTIVE
@@ -1956,7 +2010,7 @@ def main() -> None:
     global session_start_balance, session_stop_threshold, daily_pnl
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
     global consecutive_losses, last_signal_desc, last_heartbeat_ts, running_pnl
-    global live_wins, live_losses, streak_pause_until
+    global live_wins, live_losses, streak_pause_until, live_daily_realized
     global _last_known_balance, _shutdown_requested, _session_start_ts
     global _session_halted, session_state, recovery_trades
     global recovery_entry_wins, recovery_entry_losses, _session_day
@@ -2019,6 +2073,7 @@ def main() -> None:
         active_tickers.clear()
         consecutive_losses = 0
         running_pnl        = 0.0
+        live_daily_realized = 0.0
         telegram_boot(bal)
 
     resolve_cycle = 0
@@ -2038,7 +2093,7 @@ def main() -> None:
             if time.time() - last_heartbeat_ts >= 900:
                 last_heartbeat_ts = time.time()
                 hb_bal  = paper_balance if DEMO_MODE else get_live_balance()
-                hb_pnl  = paper_daily_pnl if DEMO_MODE else (hb_bal - session_start_balance)
+                hb_pnl  = paper_daily_pnl if DEMO_MODE else live_daily_realized
                 hb_open = len(open_orders)
                 hb_tr   = len([t for t in trade_history
                                 if t.get("result") in ("win", "loss", "pending")])
@@ -2085,13 +2140,19 @@ def main() -> None:
                              _live_prior, session_state.value)
                 else:
                     live_bal  = get_live_balance()
-                    daily_pnl = live_bal - session_start_balance
+                    # v9.3.1: PnL shown is REALIZED (settled) dollars — the same
+                    # value the daily-loss breaker uses. `cash` is the raw
+                    # balance−start delta, which dips by an open position's outlay
+                    # until it settles and must NOT be read as a loss.
+                    cash_delta = live_bal - session_start_balance
+                    daily_pnl  = live_daily_realized
                     wlb       = wilson_lower_bound(live_wins, live_wins + live_losses)
                     trades_since = (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
                     log.info(
-                        "Portfolio │ $%.2f │ PnL=$%+.2f │ WR=%d/%d LB=%.1f%% │ Prior=%.3f │ %s"
+                        "Portfolio │ $%.2f │ PnL=$%+.2f │ cash=$%+.2f │ WR=%d/%d LB=%.1f%% │ Prior=%.3f │ %s"
                         "%s",
-                        live_bal, daily_pnl, live_wins, live_wins + live_losses,
+                        live_bal, daily_pnl, cash_delta,
+                        live_wins, live_wins + live_losses,
                         wlb * 100, _live_prior, session_state.value,
                         f" (rec+{trades_since})" if session_state == SessionState.RECOVERY else "",
                     )
