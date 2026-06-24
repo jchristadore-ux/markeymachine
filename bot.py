@@ -1,7 +1,36 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.3.3  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.4.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.4.0 — $500 STAKE + LOSS-STOP REMOVAL (owner directive, explicit          ║
+║  authority to overwrite prior risk doctrine).                                ║
+║                                                                              ║
+║  INTENT: run $500 per trade and leave the consecutive-loss streak pause as   ║
+║  the ONLY active auto-hold. The daily-loss governors and the balance floor   ║
+║  no longer fit a $500-stake book and were removed; RECOVERY mode is gone so   ║
+║  drawdown never shrinks the stake.                                          ║
+║                                                                              ║
+║  CODE CHANGES:                                                              ║
+║  1. daily_loss_check(): the % and $ daily-loss caps are removed. The 40%     ║
+║     SESSION_STOP_FRACTION halt is RETAINED as a catastrophic backstop.       ║
+║  2. balance_floor_check() removed (function + run_decision call). No floor.  ║
+║  3. RECOVERY removed: kelly_bet() no longer applies KELLY_RECOVERY_MULT and  ║
+║     update_session_state() is a no-op, so the session stays ACTIVE.          ║
+║  4. Entry-quality gates (AGREE/NEUTRAL, OB/R²/confidence/edge/Wilson) are    ║
+║     UNCHANGED — they decide IF a trade exists, not its size.                 ║
+║                                                                              ║
+║  $500/trade is bankroll-gated, not a switch: bet = min(full_kelly ×          ║
+║  KELLY_FRACTION × balance, TRADE_SIZE_CAP, MAX_BET_FRACTION × balance). With  ║
+║  KELLY_FRACTION=0.30 the Kelly leg only reaches $500 around a $4–5k balance.  ║
+║                                                                              ║
+║  RAILWAY ENV VAR CHANGES REQUIRED (owner sets these in the Railway UI):      ║
+║    - TRADE_SIZE_DOLLARS : 5    → 500                                         ║
+║    - MAX_BET_FRACTION   : 0.04 → 1.0                                         ║
+║    - MAX_CONSEC_LOSSES  : 2    → 3                                           ║
+║    - LADDER_ENABLED     : confirm false (default)                           ║
+║  MAX_DAILY_LOSS_DOLLARS / MAX_DAILY_LOSS_PCT / MIN_BALANCE_FLOOR /           ║
+║  RECOVERY_TRIGGER_PCT are now dead config (no longer read by any guard).     ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.3.3 — MOMENTUM R² ALIGNMENT: magnitude gate still mislabeled trends.     ║
 ║                                                                              ║
@@ -173,7 +202,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.3.3"
+BOT_VERSION = "9.4.0"
 
 import base64
 import logging
@@ -981,8 +1010,6 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
     b          = (100 - contract_price_cents) / float(contract_price_cents)
     full_kelly = max(0.0, (b * win_prob - (1.0 - win_prob)) / b)
     kf         = KELLY_FRACTION
-    if session_state == SessionState.RECOVERY:
-        kf *= KELLY_RECOVERY_MULT
     base_bet = round(min(full_kelly * kf * balance, TRADE_SIZE_CAP,
                          balance * MAX_BET_FRACTION), 2)
 
@@ -1058,75 +1085,12 @@ def get_session_score() -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def update_session_state(current_balance: float) -> None:
-    global session_state, recovery_trades, recovery_entry_wins, recovery_entry_losses
-    global recovery_entered_ts
-
-    if session_state == SessionState.HALTED:
-        return
-
-    loss_pct = (session_start_balance - current_balance) / max(1.0, session_start_balance)
-
-    if session_state == SessionState.ACTIVE:
-        if loss_pct > RECOVERY_TRIGGER_PCT:
-            session_state         = SessionState.RECOVERY
-            recovery_trades       = 0
-            recovery_entry_wins   = live_wins
-            recovery_entry_losses = live_losses
-            recovery_entered_ts   = time.time()
-            log.warning("SESSION RECOVERY │ loss %.1f%% │ entry snapshot W=%d L=%d",
-                        loss_pct * 100, recovery_entry_wins, recovery_entry_losses)
-            tg.send_telegram_message(
-                f"⚠️ SESSION RECOVERY MODE\n"
-                f"Loss: {loss_pct*100:.1f}% — sizing halved."
-            )
-
-    elif session_state == SessionState.RECOVERY:
-        # v9.1.0: HARD TIMEOUT BACKSTOP. The trade-count and balance-heal exits
-        # both require the bot to keep trading; if some confluence of gates still
-        # starves recovery of trades, this guarantees the state machine cannot
-        # lock forever. recovery_entered_ts can be 0.0 if recovery was entered by
-        # a pre-v9.1.0 process — treat that as "now" so we never instantly exit
-        # on a stale-zero timestamp.
-        if recovery_entered_ts <= 0.0:
-            recovery_entered_ts = time.time()
-        elif time.time() - recovery_entered_ts > RECOVERY_MAX_SECS:
-            session_state = SessionState.ACTIVE
-            log.warning("RECOVERY EXITED │ timeout %.0fs elapsed (loss %.1f%%)",
-                        time.time() - recovery_entered_ts, loss_pct * 100)
-            tg.send_telegram_message(
-                f"✅ Recovery exited — {RECOVERY_MAX_SECS//60}min timeout "
-                f"(loss {loss_pct*100:.1f}%)"
-            )
-            return
-
-        # v9.0.9: BALANCE-BASED EXIT (primary). Recovery entry is gated on
-        # loss_pct > RECOVERY_TRIGGER_PCT; the exit must be reachable the same
-        # way. If the drawdown that triggered recovery has healed back to
-        # at/below the trigger, return to ACTIVE regardless of trade count. No
-        # edge/Kelly/loss-cap parameter loosened.
-        if loss_pct <= RECOVERY_TRIGGER_PCT:
-            session_state = SessionState.ACTIVE
-            log.info("RECOVERY EXITED │ drawdown healed (loss %.1f%% ≤ trigger %.1f%%)",
-                     loss_pct * 100, RECOVERY_TRIGGER_PCT * 100)
-            tg.send_telegram_message(
-                f"✅ Recovery exited — drawdown healed ({loss_pct*100:.1f}%)"
-            )
-            return
-
-        # Trade-count exit (faster path when AGREE trades do settle).
-        trades_since_entry = (
-            (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
-        )
-        if trades_since_entry >= RECOVERY_EXIT_TRADES:
-            wins_since = live_wins - recovery_entry_wins
-            wr = wins_since / trades_since_entry if trades_since_entry > 0 else 0.0
-            if wr >= RECOVERY_WIN_RATE_MIN:
-                session_state = SessionState.ACTIVE
-                log.info("RECOVERY EXITED │ WR=%.1f%% (%d/%d since entry)",
-                         wr * 100, wins_since, trades_since_entry)
-                tg.send_telegram_message(
-                    f"✅ Recovery exited — WR {wr*100:.0f}% ({wins_since}/{trades_since_entry})"
-                )
+    # RECOVERY mode (the 10% drawdown state that halved Kelly sizing) was removed
+    # by owner directive so that drawdown never shrinks the $500 stake. The
+    # session stays ACTIVE; the only auto-hold is the consecutive-loss streak
+    # pause, and the 40% session-stop remains as a catastrophic backstop. HALTED,
+    # if ever set, is left untouched.
+    return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1625,31 +1589,13 @@ def minutes_to_expiry(market: dict) -> float:
 # GUARD STACK
 # ─────────────────────────────────────────────────────────────────────────────
 
-def balance_floor_check(balance: float) -> bool:
-    if balance < MIN_BALANCE_FLOOR:
-        log.warning("BALANCE FLOOR │ $%.2f < $%.2f", balance, MIN_BALANCE_FLOOR)
-        return False
-    return True
-
-
 def daily_loss_check(balance: float) -> bool:
+    # Daily-loss governors (the % and $ caps) and the balance floor were removed
+    # by owner directive: the only active auto-hold is the consecutive-loss
+    # streak pause (streak_check). The 40% session-stop is retained as a
+    # catastrophic backstop only.
     global _session_halted
     if _session_halted:
-        return False
-    # v9.3.1: LIVE mode now reads realized-only PnL (live_daily_realized), NOT
-    # (balance − session_start_balance). The cash delta counts an open position's
-    # outlay as a loss the instant it fills, which halted a WINNING trade on
-    # 2026-06-23. An unsettled position must contribute 0 to this guard.
-    pnl = paper_daily_pnl if DEMO_MODE else live_daily_realized
-    # v9.1.0: halt on the tighter of the fixed dollar cap and a percentage of the
-    # session-start balance. The $15 default never bound on a ~$1969 bankroll, so
-    # a cold streak ran to −$246.87 (12.5%) before RECOVERY froze it.
-    pct_cap = MAX_DAILY_LOSS_PCT * session_start_balance if session_start_balance > 0 else 0.0
-    loss_cap = min(MAX_DAILY_LOSS, pct_cap) if pct_cap > 0 else MAX_DAILY_LOSS
-    if pnl <= -loss_cap:
-        _session_halted = True
-        log.warning("DAILY LOSS │ $%.2f ≥ cap $%.2f — halted.", abs(pnl), loss_cap)
-        telegram_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
         return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
         _session_halted = True
@@ -1804,7 +1750,7 @@ def telegram_boot(balance: float) -> None:
         f"🤖 MarkeyMachine {BOT_VERSION} STARTED\n"
         f"{mode} │ State: {session_state.value}\n"
         f"Balance: ${balance:.2f}\n"
-        f"DailyLoss≤${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}\n"
+        f"TradeCap=${TRADE_SIZE_CAP:.0f} | MaxConsecL={MAX_CONSEC_LOSSES}\n"
         f"MinConf={MIN_CONFIDENCE} | MinWinP={MIN_WIN_PROB*100:.0f}% | R²≥{R2_TREND_THRESHOLD}\n"
         f"OBDepth≥${MIN_OB_DEPTH:.0f} | OBImb≥{OB_IMBALANCE_THRESH*100:.0f}%\n"
         f"AGREE-gate={'ON' if REQUIRE_AGREE_MOMENTUM else 'OFF'} | "
@@ -1848,8 +1794,6 @@ def run_decision(market: dict, balance: float) -> None:
         return
     yes_mid = (yes_bid + yes_ask) // 2
 
-    if not balance_floor_check(balance):
-        return
     if not expiry_guard(yes_mid):
         return
     if not spread_check(yes_bid, yes_ask):

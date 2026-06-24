@@ -29,7 +29,7 @@ Scans ALL open BTC markets across KXBTC15M/KXBTCD/KXBTC series and evaluates eac
 
 ### Sizing — Fractional Kelly
 `f* = (b×p - q) / b` where b = net odds, p = OB win probability, q = 1-p.
-Kelly fraction: 35% (grid-search optimal). Capped at TRADE_SIZE_DOLLARS and 20% of balance.
+Kelly fraction: 30%. Final stake = `min(full_kelly × KELLY_FRACTION × balance, TRADE_SIZE_DOLLARS, MAX_BET_FRACTION × balance)`. With `MAX_BET_FRACTION=1.0` only the `$500` `TRADE_SIZE_DOLLARS` cap and the Kelly leg bind — and $500 is bankroll-gated: the Kelly leg only reaches it around a $4–5k balance.
 
 ### Execution — Maker Limit Orders
 Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee. Takers pay ~1% of winnings. Fee drag on taker orders: ~$5+/day at scale.
@@ -45,13 +45,16 @@ A performance-driven overlay on the Kelly stake that scales trade size by a mult
 
 | Control | Behavior |
 |---|---|
-| Balance floor | Halts if balance < MIN_BALANCE_FLOOR ($5 default) |
-| Session stop | Halts if balance drops below 50% of session-start balance |
-| Daily loss cap | Halts if session P&L ≤ -MAX_DAILY_LOSS_DOLLARS |
+| **Streak filter** *(only active auto-hold)* | After `MAX_CONSEC_LOSSES` (3) consecutive losses, pauses trading for `STREAK_PAUSE_SECS` then resets the counter |
+| Session stop *(catastrophic backstop)* | Halts if balance drops below `SESSION_STOP_FRACTION` (40%) of session-start balance |
 | Position guard | One entry per market ticker, no re-entry until expiry |
 | Expiry guard | Skips contracts priced >85c or <15c (near-certain outcome, zero EV) |
 | Spread guard | Skips zero/crossed spreads (broken book) |
-| Streak filter | After 3 consecutive losses, skips one window then resets counter |
+
+> **Removed (v9.4.0, owner directive):** the % and $ daily-loss caps, the
+> balance floor, and RECOVERY mode (10% drawdown sizing cut). The consecutive-loss
+> streak pause is the only active auto-hold; the 40% session stop is retained
+> only as a catastrophic backstop.
 | **Liquidity filter** *(v5.3.0)* | Skips low-liquidity UTC hours (default 4-8 UTC / midnight-4am ET) |
 | **Concurrent limit** *(v5.3.0)* | Max simultaneous open positions (default 2) |
 | **Stale cancel** *(v5.3.0)* | Auto-cancels unfilled orders after timeout (default 300s) |
@@ -135,12 +138,12 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `KALSHI_PRIVATE_KEY_PEM` | required | Full PEM. Replace newlines with `\n` if needed |
 | `DEMO_MODE` | `true` | Set `false` for live trading |
 | `TRADER_MODE` | `quant` | Only `quant` is recommended for live |
-| `TRADE_SIZE_DOLLARS` | `5` | Max dollars per trade |
-| `MAX_DAILY_LOSS_DOLLARS` | `20` | Hard stop loss per session |
-| `MIN_BALANCE_FLOOR` | `5` | Halt if balance drops below this |
+| `TRADE_SIZE_DOLLARS` | `500` | Hard cap on dollars per trade (bankroll-gated by the Kelly leg) |
+| `MAX_BET_FRACTION` | `1.0` | Per-trade fraction-of-balance cap; `1.0` means only `TRADE_SIZE_DOLLARS` and the Kelly leg bind |
+| `SESSION_STOP_FRACTION` | `0.40` | Catastrophic backstop — halt below this fraction of session-start balance |
 | `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |
-| `KELLY_FRACTION` | `0.35` | Grid-search optimal — do not raise without backtesting |
-| `MAX_CONSEC_LOSSES` | `3` | Streak filter threshold |
+| `KELLY_FRACTION` | `0.30` | Fraction of full Kelly — do not raise without backtesting |
+| `MAX_CONSEC_LOSSES` | `3` | Streak pause threshold — the only active auto-hold |
 | `PAPER_BALANCE` | `25.0` | Starting balance in paper mode |
 | `POLL_INTERVAL_SECS` | `30` | Market scan frequency |
 | `TELEGRAM_BOT_TOKEN` | optional | From @BotFather |

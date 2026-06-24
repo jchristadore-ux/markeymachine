@@ -203,157 +203,57 @@ class TestRestoredThresholds:
 # P0: RISK CONTROLS
 # ═════════════════════════════════════════════════════════════════════════════
 
-class TestBalanceFloorCheck:
-    def test_below_floor(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(4.99) is False
-
-    def test_at_floor(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(5.00) is True
-
-    def test_above_floor(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(100.0) is True
-
-    def test_zero(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(0.0) is False
-
-
 class TestDailyLossCheck:
+    """v9.4.0: the % and $ daily-loss governors were removed by owner directive.
+    daily_loss_check() now enforces ONLY the 40% catastrophic session stop; the
+    consecutive-loss streak pause (streak_check) is the active auto-hold."""
+
     def setup_method(self):
         bot._session_halted = False
 
-    def test_within_limit(self, monkeypatch):
+    def test_large_paper_loss_no_longer_halts(self, monkeypatch):
+        # A deep daily drawdown must NOT halt now that the daily caps are gone.
         monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "paper_daily_pnl", -10.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 20.0)
+        monkeypatch.setattr(bot, "paper_daily_pnl", -5000.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        assert bot.daily_loss_check(15.0) is True
+        assert bot.daily_loss_check(1000.0) is True
+        assert bot._session_halted is False
 
-    def test_at_limit(self, monkeypatch):
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "paper_daily_pnl", -20.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 20.0)
+    def test_large_realized_loss_no_longer_halts(self, monkeypatch):
+        # Same in LIVE mode: realized drawdown alone no longer trips a breaker.
+        monkeypatch.setattr(bot, "DEMO_MODE", False)
+        monkeypatch.setattr(bot, "live_daily_realized", -5000.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        assert bot.daily_loss_check(5.0) is False
+        assert bot.daily_loss_check(1000.0) is True
+        assert bot._session_halted is False
 
     def test_session_stop_triggers(self, monkeypatch):
         monkeypatch.setattr(bot, "DEMO_MODE", True)
         monkeypatch.setattr(bot, "paper_daily_pnl", 0.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 100.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 12.50)
         assert bot.daily_loss_check(10.0) is False
 
     def test_session_stop_ok_when_above(self, monkeypatch):
         monkeypatch.setattr(bot, "DEMO_MODE", True)
         monkeypatch.setattr(bot, "paper_daily_pnl", 0.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 100.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 12.50)
         assert bot.daily_loss_check(20.0) is True
 
     def test_halted_flag_blocks(self, monkeypatch):
         monkeypatch.setattr(bot, "_session_halted", True)
         monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "paper_daily_pnl", 0.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 100.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
         assert bot.daily_loss_check(50.0) is False
 
-    def test_halt_is_permanent_after_recovery(self, monkeypatch):
-        """Balance recovery above session_stop_threshold must not clear halt."""
+    def test_session_stop_halt_is_permanent(self, monkeypatch):
+        """Balance recovery above session_stop_threshold must not clear the halt."""
         monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "paper_daily_pnl", -5.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 100.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 12.50)
-        # Trigger halt at low balance
-        result1 = bot.daily_loss_check(10.0)
-        assert result1 is False
+        # Trigger the catastrophic session stop at low balance
+        assert bot.daily_loss_check(10.0) is False
         assert bot._session_halted is True
         # Even with high balance, stays halted
-        result2 = bot.daily_loss_check(50.0)
-        assert result2 is False
-
-    def test_pct_cap_binds_before_dollar_cap(self, monkeypatch):
-        """v9.1.0: on a large bankroll the % cap halts before the $ cap would."""
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)   # dollar cap never binds
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)  # 6% = $120
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        monkeypatch.setattr(bot, "paper_daily_pnl", -100.0)  # above the $120 cap
-        assert bot.daily_loss_check(1900.0) is True
-        monkeypatch.setattr(bot, "paper_daily_pnl", -130.0)  # past the $120 cap
-        assert bot.daily_loss_check(1870.0) is False
-
-    def test_dollar_cap_still_binds_for_small_account(self, monkeypatch):
-        """The fixed $ cap is retained for tiny accounts where it is tighter."""
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 15.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 20.0)  # 6% = $1.20
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        # pct cap ($1.20) is tighter than $15 here, so it binds first
-        monkeypatch.setattr(bot, "paper_daily_pnl", -2.0)
-        assert bot.daily_loss_check(18.0) is False
-
-
-class TestLiveRealizedDailyLoss:
-    """v9.3.1: the LIVE daily-loss breaker must read realized-only PnL, never the
-    balance−start cash delta. Reproduces the 2026-06-23 incident where a winning
-    trade's open-position cash outlay ($99.71) halted the bot before settlement."""
-
-    def setup_method(self):
-        bot._session_halted = False
-
-    def test_open_position_cash_outlay_does_not_halt(self, monkeypatch):
-        # LIVE mode. Session started at $1477.74; cap = 6% = $88.66.
-        monkeypatch.setattr(bot, "DEMO_MODE", False)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        # Position is OPEN: nothing settled, so realized = 0 even though the
-        # broker balance is down by the $99.71 cash outlay.
-        monkeypatch.setattr(bot, "live_daily_realized", 0.0)
-        # balance passed in reflects the cash debit; the breaker must ignore it.
-        assert bot.daily_loss_check(1378.03) is True
-        assert bot._session_halted is False
-
-    def test_realized_win_keeps_trading(self, monkeypatch):
-        monkeypatch.setattr(bot, "DEMO_MODE", False)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        # The trade settled +$69.29 (the real outcome on 2026-06-23).
-        monkeypatch.setattr(bot, "live_daily_realized", 69.29)
-        assert bot.daily_loss_check(1547.03) is True
-        assert bot._session_halted is False
-
-    def test_genuine_realized_loss_still_halts(self, monkeypatch):
-        # The breaker must still fire on a REAL realized drawdown past the cap.
-        monkeypatch.setattr(bot, "DEMO_MODE", False)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        monkeypatch.setattr(bot, "live_daily_realized", -90.0)  # > $88.66 cap
-        assert bot.daily_loss_check(1387.74) is False
-        assert bot._session_halted is True
-
-    def test_breaker_ignores_balance_delta_in_live(self, monkeypatch):
-        # Even a catastrophic-looking balance dip must not halt when realized PnL
-        # is still within cap (e.g. multiple open positions mid-flight).
-        monkeypatch.setattr(bot, "DEMO_MODE", False)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 1477.74)
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        monkeypatch.setattr(bot, "live_daily_realized", -10.0)  # within cap
-        assert bot.daily_loss_check(1100.00) is True  # huge cash dip, ignored
-        assert bot._session_halted is False
+        assert bot.daily_loss_check(50.0) is False
 
 
 class TestSpreadCheck:
@@ -432,6 +332,15 @@ class TestStreakCheck:
         assert result is True
         assert bot.consecutive_losses == 0
 
+    def test_three_loss_threshold_is_the_only_auto_hold(self, monkeypatch):
+        """v9.4.0: at MAX_CONSEC_LOSSES=3, two losses keep trading; three pause."""
+        monkeypatch.setattr(bot, "MAX_CONSEC_LOSSES", 3)
+        bot.streak_pause_until = time.time() + 9999
+        bot.consecutive_losses = 2
+        assert bot.streak_check() is True   # 2 losses → still trading
+        bot.consecutive_losses = 3
+        assert bot.streak_check() is False  # 3 losses → paused
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # P1: SIGNAL MATH
@@ -486,17 +395,37 @@ class TestKellyBet:
         bet = bot.kelly_bet(0.90, 40, 100.0)
         assert bet <= 2.0
 
-    def test_recovery_halves_kelly(self, monkeypatch):
+    def test_recovery_no_longer_shrinks_stake(self, monkeypatch):
+        """v9.4.0: RECOVERY mode was removed — session state must not alter size."""
         monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 100.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "KELLY_RECOVERY_MULT", 0.50)
         monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.50)
         monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         bet_active = bot.kelly_bet(0.70, 50, 100.0)
         monkeypatch.setattr(bot, "session_state", SessionState.RECOVERY)
         bet_recovery = bot.kelly_bet(0.70, 50, 100.0)
-        assert bet_recovery < bet_active
-        assert abs(bet_recovery - bet_active * 0.50) < 0.01
+        assert bet_recovery == bet_active
+
+    def test_500_cap_reachable_on_large_bankroll(self, monkeypatch):
+        """v9.4.0: with MAX_BET_FRACTION=1.0 the $500 cap binds at a high-edge,
+        high-balance case — proving the new cap is actually reachable."""
+        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 1.0)
+        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
+        # full_kelly at 0.90 win prob, 40c price: b=1.5, fk=(1.5*0.9-0.1)/1.5≈0.833
+        # kelly leg = 0.833*0.30*5000 ≈ $1250 → clamps to the $500 cap.
+        bet = bot.kelly_bet(0.90, 40, 5000.0)
+        assert bet == 500.0
+
+    def test_500_cap_is_bankroll_gated(self, monkeypatch):
+        """Below ~$4-5k balance the Kelly leg binds well under $500."""
+        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 1.0)
+        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
+        bet = bot.kelly_bet(0.70, 50, 500.0)
+        assert 0 < bet < 500.0
 
     def test_boundary_prices(self, monkeypatch):
         monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 5.0)
@@ -1115,67 +1044,26 @@ class TestPaperModeAccounting:
 
 
 class TestUpdateSessionState:
-    """v9.1.0 recovery state machine: entry timestamp + hard timeout backstop."""
+    """v9.4.0: RECOVERY mode was removed by owner directive. update_session_state
+    is now a no-op — a drawdown must NOT flip the session into RECOVERY (which
+    would have shrunk the stake)."""
 
     def setup_method(self):
-        bot.session_state         = SessionState.ACTIVE
-        bot.recovery_entry_wins   = 0
-        bot.recovery_entry_losses = 0
-        bot.recovery_entered_ts   = 0.0
-        bot.live_wins             = 0
-        bot.live_losses           = 0
+        bot.session_state = SessionState.ACTIVE
 
     def _no_telegram(self, monkeypatch):
         monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
 
-    def test_entry_stamps_recovery_time(self, monkeypatch):
+    def test_deep_drawdown_does_not_enter_recovery(self, monkeypatch):
         self._no_telegram(monkeypatch)
         monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
         bot.session_state = SessionState.ACTIVE
-        bot.update_session_state(1750.0)  # 12.5% loss → enter RECOVERY
-        assert bot.session_state == SessionState.RECOVERY
-        assert bot.recovery_entered_ts > 0.0
-
-    def test_timeout_forces_exit(self, monkeypatch):
-        """The deadlock backstop: stuck in RECOVERY past RECOVERY_MAX_SECS → ACTIVE."""
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
-        bot.session_state       = SessionState.RECOVERY
-        bot.recovery_entered_ts = time.time() - 7200  # 2h ago
-        bot.update_session_state(1750.0)  # still 12.5% down, 0 trades since entry
+        bot.update_session_state(1750.0)  # 12.5% loss — would have triggered RECOVERY
         assert bot.session_state == SessionState.ACTIVE
 
-    def test_within_timeout_stays_recovery(self, monkeypatch):
+    def test_active_stays_active(self, monkeypatch):
         self._no_telegram(monkeypatch)
         monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
-        bot.session_state       = SessionState.RECOVERY
-        bot.recovery_entered_ts = time.time() - 60  # 1 min ago
-        bot.update_session_state(1750.0)
-        assert bot.session_state == SessionState.RECOVERY
-
-    def test_zero_timestamp_is_initialized_not_instant_exit(self, monkeypatch):
-        """A stale 0.0 ts (recovery entered by an older build) must not instant-exit."""
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
-        bot.session_state       = SessionState.RECOVERY
-        bot.recovery_entered_ts = 0.0
-        bot.update_session_state(1750.0)
-        assert bot.session_state == SessionState.RECOVERY
-        assert bot.recovery_entered_ts > 0.0
-
-    def test_balance_heal_still_exits(self, monkeypatch):
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
-        bot.session_state       = SessionState.RECOVERY
-        bot.recovery_entered_ts = time.time() - 60
-        bot.update_session_state(1850.0)  # 7.5% loss ≤ 10% trigger → heal exit
+        bot.session_state = SessionState.ACTIVE
+        bot.update_session_state(1990.0)  # tiny loss
         assert bot.session_state == SessionState.ACTIVE
