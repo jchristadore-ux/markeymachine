@@ -22,17 +22,21 @@ At a 50¢ price, breakeven win rate = 50%. Edge exists only when true win probab
 A trade is placed **only when all nine layers pass simultaneously**. Every layer must pass. One failure = no trade.
 
 ### Layer 1 — Hard Guards (always first)
-- [ ] Balance ≥ $5.00 (floor)
 - [ ] Contract mid-price between 15¢ and 85¢ (not near-certain outcome)
 - [ ] Bid/ask spread > 0¢ (not a crossed or broken book)
 - [ ] No existing position on this ticker
 - [ ] Cooldown timer ≥ 120 seconds since last trade
-- [ ] Daily session P&L above halt threshold
+- [ ] Balance above the 40% session-stop threshold (catastrophic backstop only)
+
+> **v9.4.0 (owner directive):** the balance floor and the daily-loss caps were
+> removed from the hard guards. The consecutive-loss streak pause (Layer 2) is
+> the only active auto-hold; the 40% session stop remains solely as a
+> catastrophic backstop.
 
 ### Layer 2 — Streak Pause
-- [ ] Fewer than 2 consecutive losses **OR** 30-minute cooldown has expired since the pause was triggered
+- [ ] Fewer than **3** consecutive losses **OR** the pause cooldown has expired since the pause was triggered
 
-**Rationale:** Two consecutive losses suggest either bad luck or a regime where the signal has no edge. 30 minutes is enough for BTC to complete one or more micro-regimes. One window (30 seconds) is not.
+**Rationale:** Three consecutive losses suggest either bad luck or a regime where the signal has no edge. The pause is long enough for BTC to complete one or more micro-regimes. One window (30 seconds) is not.
 
 ### Layer 3 — Statistical Performance Guard
 - [ ] After 20+ settled trades: Wilson score confidence interval lower bound ≥ 50%
@@ -118,11 +122,15 @@ The bot **stands down** and logs the reason in any of these conditions:
 | Confidence score < 65 | All factors taken together don't constitute a clear setup. |
 | Low-liquidity hours | UTC 0-4 (post-US-close). Thin, unreliable books. |
 | < 3 minutes to expiry | Price is resolving, not positioning. OB reflects certainty, not edge. |
-| 2+ consecutive losses | Pause 30 minutes. Let the regime shift before re-entry. |
+| 3+ consecutive losses | Streak pause. Let the regime shift before re-entry. **(The only active auto-hold.)** |
 | Wilson CI LB < 50% | Live edge unproven statistically. Cannot risk capital without evidence. |
-| Balance < $5.00 | Capital preservation. Micro-bets cannot compound meaningfully. |
-| Daily session stop | 50% balance drawdown from session start. Preserve remaining capital. |
+| Session stop (catastrophic backstop) | 40% balance drawdown from session start. Preserve remaining capital. |
 | Market mid > 85¢ or < 15¢ | Outcome near-certain. EV is minimal. Skip. |
+
+> **v9.4.0 (owner directive):** the balance floor and the % / $ daily-loss caps
+> were removed as no-trade conditions. The 3-consecutive-loss streak pause is
+> the only active auto-hold; the 40% session stop is retained only as a
+> catastrophic backstop.
 
 ---
 
@@ -143,9 +151,9 @@ actual_bet = min(kelly_bet, TRADE_SIZE_DOLLARS, MAX_BET_FRACTION × balance)
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
-| `kelly_fraction` | 0.35 | 35% of full Kelly — reduces variance, survives bad runs |
-| `TRADE_SIZE_DOLLARS` | $5.00 | Hard cap per trade |
-| `MAX_BET_FRACTION` | 10% | Max 10% of balance per trade |
+| `kelly_fraction` | 0.30 | 30% of full Kelly — reduces variance, survives bad runs |
+| `TRADE_SIZE_DOLLARS` | $500.00 | Hard cap per trade (v9.4.0). **Bankroll-gated:** the Kelly leg only reaches $500 around a $4–5k balance; below that, trades scale down proportionally. |
+| `MAX_BET_FRACTION` | 1.0 | v9.4.0: effectively uncapped, so only `TRADE_SIZE_DOLLARS` and the Kelly leg bind. |
 
 ### Why 10% balance cap (not 20%)
 
@@ -265,9 +273,13 @@ Confidence │ Score 48 < minimum 65 — no trade.
 
 Target metrics (after 100+ qualified trades):
 - Win rate: ≥ 63%
-- Expectancy per trade: > $0.25 at $25 balance
-- Max daily loss: < 15% of balance
+- Expectancy per trade: positive at the operating balance
 - Consecutive loss streak: rarely > 3
+
+> **v9.4.0:** "Max daily loss < 15%" remains a *target*, but it is no longer
+> enforced by an auto-halt — the daily-loss governors were removed by owner
+> directive. The streak pause and the 40% catastrophic session stop are the only
+> remaining holds.
 
 If win rate on qualified setups (all 9 layers passed) falls below 55% over 50+ trades, the strategy's primary signal (OB imbalance) has lost its edge. The parameters need revision, not just tightening.
 
@@ -279,7 +291,7 @@ If win rate on qualified setups (all 9 layers passed) falls below 55% over 50+ t
 - Trade during a ranging or high-volatility BTC regime
 - Trade with less than $50 of near-money order book depth
 - Ignore the Wilson CI performance gate after sufficient sample size
-- Resume trading immediately after 2 consecutive losses
+- Resume trading immediately after 3 consecutive losses
 - Use position sizing that doesn't scale with actual balance
 - Represent paper mode results as valid P&L (v5 P&L bug is fixed in v6)
 
