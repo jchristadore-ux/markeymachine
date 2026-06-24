@@ -1,7 +1,22 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.4.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.4.1  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.4.1 — FLAT $500 STAKE (owner directive): $500 trades fire regardless of  ║
+║  balance.                                                                    ║
+║                                                                              ║
+║  v9.4.0 lifted the caps but the bet was still Kelly-scaled                   ║
+║  (full_kelly × KELLY_FRACTION × balance), so $500 was only reachable around  ║
+║  a $4–5k balance. kelly_bet() now uses Kelly ONLY as an edge gate (positive  ║
+║  full_kelly = positive expectancy) and stakes the full TRADE_SIZE_CAP on     ║
+║  every qualifying trade — no balance/Kelly/MAX_BET_FRACTION down-scaling.    ║
+║  The sole clamp is cash on hand (cannot stake more than the account holds),  ║
+║  so below a $500 balance the bot goes all-in. MAX_BET_FRACTION is now dead   ║
+║  config. Entry-quality gates are unchanged.                                  ║
+║                                                                              ║
+║  RAILWAY: TRADE_SIZE_DOLLARS=500 is the flat stake (still required).         ║
+║  MAX_BET_FRACTION no longer affects sizing.                                  ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.4.0 — $500 STAKE + LOSS-STOP REMOVAL (owner directive, explicit          ║
 ║  authority to overwrite prior risk doctrine).                                ║
@@ -202,7 +217,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.4.0"
+BOT_VERSION = "9.4.1"
 
 import base64
 import logging
@@ -1009,15 +1024,19 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
         return 0.0
     b          = (100 - contract_price_cents) / float(contract_price_cents)
     full_kelly = max(0.0, (b * win_prob - (1.0 - win_prob)) / b)
-    kf         = KELLY_FRACTION
-    base_bet = round(min(full_kelly * kf * balance, TRADE_SIZE_CAP,
-                         balance * MAX_BET_FRACTION), 2)
+    # v9.4.1 (owner directive): FLAT stake. Kelly is used ONLY as an edge gate —
+    # a positive full_kelly means the bet has positive expectancy. The stake size
+    # itself is the full TRADE_SIZE_CAP regardless of balance (no Kelly or
+    # MAX_BET_FRACTION down-scaling), so $500 trades fire at any bankroll. The
+    # only clamp is the cash on hand: you cannot stake more than the account holds.
+    if full_kelly <= 0.0:
+        return 0.0
+    base_bet = round(min(TRADE_SIZE_CAP, balance), 2)
 
-    # Laddering overlay (opt-in). Scales the Kelly stake by a performance
-    # multiplier, but never past 2× the trade-size cap or the balance fraction.
+    # Laddering overlay (opt-in). Scales the flat stake by a performance
+    # multiplier, but never past 2× the trade-size cap or the cash on hand.
     if stake_ladder is not None:
-        ceiling  = min(stake_ladder.cfg.max_multiplier * TRADE_SIZE_CAP,
-                       balance * MAX_BET_FRACTION)
+        ceiling  = min(stake_ladder.cfg.max_multiplier * TRADE_SIZE_CAP, balance)
         decision = stake_ladder.get_stake(base_bet, max_stake=ceiling)
         return decision.stake
 

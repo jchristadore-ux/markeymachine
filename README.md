@@ -27,9 +27,9 @@ Compares the current order book snapshot to the previous one for each ticker. Tr
 ### v5.3.0: Multi-Market Scanner
 Scans ALL open BTC markets across KXBTC15M/KXBTCD/KXBTC series and evaluates each for signals. The bot tries every valid market per cycle instead of just picking the one closest to 50c. Position guard and cooldown prevent over-trading.
 
-### Sizing — Fractional Kelly
+### Sizing — Flat Stake *(v9.4.1)*
 `f* = (b×p - q) / b` where b = net odds, p = OB win probability, q = 1-p.
-Kelly fraction: 30%. Final stake = `min(full_kelly × KELLY_FRACTION × balance, TRADE_SIZE_DOLLARS, MAX_BET_FRACTION × balance)`. With `MAX_BET_FRACTION=1.0` only the `$500` `TRADE_SIZE_DOLLARS` cap and the Kelly leg bind — and $500 is bankroll-gated: the Kelly leg only reaches it around a $4–5k balance.
+Kelly is now used **only as an edge gate** (`f* > 0` ⇒ positive expectancy). The stake is the **flat `TRADE_SIZE_DOLLARS` ($500) on every qualifying trade, regardless of balance** — no Kelly or balance-fraction down-scaling. The only clamp is cash on hand, so below a $500 balance the bot stakes whatever remains. `MAX_BET_FRACTION` no longer affects sizing. See the risk note in [`TRADING_DOCTRINE.md`](TRADING_DOCTRINE.md) §5 — flat sizing does not self-correct on drawdown.
 
 ### Execution — Maker Limit Orders
 Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee. Takers pay ~1% of winnings. Fee drag on taker orders: ~$5+/day at scale.
@@ -138,11 +138,11 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `KALSHI_PRIVATE_KEY_PEM` | required | Full PEM. Replace newlines with `\n` if needed |
 | `DEMO_MODE` | `true` | Set `false` for live trading |
 | `TRADER_MODE` | `quant` | Only `quant` is recommended for live |
-| `TRADE_SIZE_DOLLARS` | `500` | Hard cap on dollars per trade (bankroll-gated by the Kelly leg) |
-| `MAX_BET_FRACTION` | `1.0` | Per-trade fraction-of-balance cap; `1.0` means only `TRADE_SIZE_DOLLARS` and the Kelly leg bind |
+| `TRADE_SIZE_DOLLARS` | `500` | Flat per-trade stake (v9.4.1). Fires at any balance; clamped only to cash on hand |
+| `MAX_BET_FRACTION` | `1.0` | **Dead config (v9.4.1)** — flat sizing ignores it |
 | `SESSION_STOP_FRACTION` | `0.40` | Catastrophic backstop — halt below this fraction of session-start balance |
 | `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |
-| `KELLY_FRACTION` | `0.30` | Fraction of full Kelly — do not raise without backtesting |
+| `KELLY_FRACTION` | `0.30` | v9.4.1: only gates edge (`>0`); no longer scales stake size |
 | `MAX_CONSEC_LOSSES` | `3` | Streak pause threshold — the only active auto-hold |
 | `PAPER_BALANCE` | `25.0` | Starting balance in paper mode |
 | `POLL_INTERVAL_SECS` | `30` | Market scan frequency |

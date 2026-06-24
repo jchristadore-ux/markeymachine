@@ -406,26 +406,27 @@ class TestKellyBet:
         bet_recovery = bot.kelly_bet(0.70, 50, 100.0)
         assert bet_recovery == bet_active
 
-    def test_500_cap_reachable_on_large_bankroll(self, monkeypatch):
-        """v9.4.0: with MAX_BET_FRACTION=1.0 the $500 cap binds at a high-edge,
-        high-balance case — proving the new cap is actually reachable."""
+    def test_flat_500_on_large_bankroll(self, monkeypatch):
+        """v9.4.1: flat $500 stake on any positive-edge trade at a high balance."""
         monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 1.0)
         monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
-        # full_kelly at 0.90 win prob, 40c price: b=1.5, fk=(1.5*0.9-0.1)/1.5≈0.833
-        # kelly leg = 0.833*0.30*5000 ≈ $1250 → clamps to the $500 cap.
-        bet = bot.kelly_bet(0.90, 40, 5000.0)
-        assert bet == 500.0
+        assert bot.kelly_bet(0.90, 40, 5000.0) == 500.0
 
-    def test_500_cap_is_bankroll_gated(self, monkeypatch):
-        """Below ~$4-5k balance the Kelly leg binds well under $500."""
+    def test_flat_500_fires_regardless_of_balance(self, monkeypatch):
+        """v9.4.1: a modest-edge trade on a small (but ≥$500) balance still
+        stakes the full $500 — no Kelly/balance down-scaling."""
         monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 1.0)
         monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
-        bet = bot.kelly_bet(0.70, 50, 500.0)
-        assert 0 < bet < 500.0
+        assert bot.kelly_bet(0.70, 50, 600.0) == 500.0
+
+    def test_clamped_to_cash_when_balance_below_stake(self, monkeypatch):
+        """v9.4.1: the only clamp is cash on hand — below $500 the bot goes all-in."""
+        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
+        assert bot.kelly_bet(0.70, 50, 300.0) == 300.0
 
     def test_boundary_prices(self, monkeypatch):
         monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 5.0)
@@ -435,14 +436,14 @@ class TestKellyBet:
         assert bot.kelly_bet(0.70, 0, 25.0) == 0.0
         assert bot.kelly_bet(0.70, 100, 25.0) == 0.0
 
-    def test_capped_at_bet_fraction(self, monkeypatch):
-        """v9.1.0: a single bet never exceeds MAX_BET_FRACTION of bankroll."""
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 1_000.0)  # dollar cap not binding
-        monkeypatch.setattr(bot, "KELLY_FRACTION", 1.0)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)
+    def test_bet_fraction_no_longer_caps(self, monkeypatch):
+        """v9.4.1: MAX_BET_FRACTION is dead config — flat sizing ignores it.
+        A small fraction must NOT shrink the stake below TRADE_SIZE_CAP."""
+        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)  # would have capped at $40
         monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
-        bet = bot.kelly_bet(0.90, 40, 1_000.0)
-        assert bet <= 1_000.0 * 0.04 + 0.01
+        assert bot.kelly_bet(0.90, 40, 1_000.0) == 500.0
 
 
 class TestComputeMomentum:

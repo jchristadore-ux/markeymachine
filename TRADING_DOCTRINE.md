@@ -136,34 +136,43 @@ The bot **stands down** and logs the reason in any of these conditions:
 
 ## 5. Position Sizing — How Much to Risk
 
-### Formula (v6.0.0 — corrected)
+### Formula (v9.4.1 — flat stake, owner directive)
 
 ```
 full_kelly = (b × win_prob − (1 − win_prob)) / b
            where b = (100 − price_cents) / price_cents
 
-kelly_bet  = full_kelly × kelly_fraction × balance
+# Kelly is now ONLY an edge gate: a positive full_kelly means positive
+# expectancy. It NO LONGER scales the stake.
+actual_bet = TRADE_SIZE_DOLLARS              if full_kelly > 0
+           = 0 (no trade)                    otherwise
 
-actual_bet = min(kelly_bet, TRADE_SIZE_DOLLARS, MAX_BET_FRACTION × balance)
+# Sole clamp: cannot stake more than the cash on hand.
+actual_bet = min(actual_bet, balance)
 ```
+
+Every qualifying trade stakes the **full `TRADE_SIZE_DOLLARS` ($500) regardless
+of balance** — there is no Kelly or balance-fraction down-scaling. Below a $500
+balance the bot stakes whatever cash remains (all-in). This is a deliberate
+departure from the old self-correcting fractional-Kelly sizing.
 
 ### Parameters
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
-| `kelly_fraction` | 0.30 | 30% of full Kelly — reduces variance, survives bad runs |
-| `TRADE_SIZE_DOLLARS` | $500.00 | Hard cap per trade (v9.4.0). **Bankroll-gated:** the Kelly leg only reaches $500 around a $4–5k balance; below that, trades scale down proportionally. |
-| `MAX_BET_FRACTION` | 1.0 | v9.4.0: effectively uncapped, so only `TRADE_SIZE_DOLLARS` and the Kelly leg bind. |
+| `kelly_fraction` | 0.30 | v9.4.1: no longer affects stake size — only the `full_kelly > 0` edge gate matters. |
+| `TRADE_SIZE_DOLLARS` | $500.00 | The flat per-trade stake (v9.4.1). Fires at any bankroll; clamped only to cash on hand. |
+| `MAX_BET_FRACTION` | 1.0 | v9.4.1: **dead config** — flat sizing ignores it. |
 
-### Why 10% balance cap (not 20%)
+### Risk note — flat sizing does NOT self-correct (v9.4.1)
 
-v5 used 20% of balance. At a $25 balance, that permitted $5 bets (20% per trade). With a real win rate of 50% instead of 68.8%, this produces rapid drawdown. At 10%, five consecutive losses at flat 50¢ price:
-
-```
-$25.00 → $22.50 → $20.25 → $18.23 → $16.40 → $14.76
-```
-
-That's a 41% drawdown from 5 consecutive losses — painful, but survivable. The session stop at 50% would not trigger. Recovery is possible.
+Historically the bot sized as a fraction of balance, so stakes shrank
+automatically as the bankroll fell. Flat $500 sizing removes that cushion by
+design: at a $2,000 balance, three consecutive $500 losses ($1,500) is a 75%
+drawdown, and the only remaining auto-holds are the 3-consecutive-loss streak
+pause and the 40% catastrophic session stop. This is the owner's explicit,
+accepted trade-off for guaranteed $500 stakes — it is not a self-correcting
+sizing model.
 
 ### v5 Sizing Bug (now fixed)
 
