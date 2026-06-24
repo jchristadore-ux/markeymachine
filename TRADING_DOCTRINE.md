@@ -183,6 +183,48 @@ bet = full_kelly * kelly_frac * TRADE_SIZE_DOLLARS * 4.0
 
 This used `TRADE_SIZE_DOLLARS * 4.0` (= $20) as a proxy for bankroll rather than actual balance. As balance decayed from $53 to $26, bet sizes did **not** shrink proportionally — they stayed anchored to the fixed $20 proxy. This accelerated drawdown instead of allowing the position sizing to self-correct.
 
+### Recovery Mode — two-tier sizing (v9.5.0)
+
+The active stake is **derived from a persistent mode**, never read raw from a
+single env var at the sizing call. `active_trade_size()` is the single source of
+truth:
+
+| Mode | Stake | Trigger |
+|------|-------|---------|
+| **Normal** | `NORMAL_TRADE_SIZE` ($500) | default |
+| **Recovery** | `RECOVERY_TRADE_SIZE` ($100) | a full-size trade settles a loss |
+
+**Lifecycle**
+
+1. A **normal-mode** trade settles a **loss** → recovery activates. The
+   **recovery target** is set to the realized balance recorded *immediately
+   before that trade was entered* (stamped on the order at placement, so it is
+   exact — never reconstructed from PnL).
+2. While recovering, every trade uses `RECOVERY_TRADE_SIZE`. Trade evaluation,
+   P/L tracking, halts, cooldowns and the streak pause are all unchanged.
+3. As soon as the realized balance is **≥ the recovery target**, recovery
+   deactivates and sizing returns to `NORMAL_TRADE_SIZE` — no manual step.
+
+**Invariants / edge cases (why it can't get stuck or oscillate)**
+
+- **Entry is event-driven** (a settled full-size loss). A loss that occurs while
+  *already* recovering does **not** move the target — the goal stays the
+  original pre-loss balance.
+- **Exit is balance-driven and checked every cycle and on boot**, independent of
+  whether any trade fires. So once balance reaches the target even once,
+  recovery clears. It cannot wedge.
+- **No oscillation:** crossing the target only ever *exits* recovery; re-entry
+  requires a brand-new full-size loss, so there is no per-cycle flip-flop.
+- **Boot reconciliation** clears recovery if balance already ≥ target (e.g. it
+  recovered while the bot was offline) and clears a corrupt/zero target.
+- **Persistence:** state `{active, target_balance}` is written atomically to
+  `RECOVERY_STATE_PATH`. This survives an in-container restart. **Railway's
+  container filesystem is wiped on every redeploy**, so for the state to survive
+  a *redeploy* you must mount a **Railway Volume** and point
+  `RECOVERY_STATE_PATH` at it (e.g. `/data/recovery_state.json`). Without a
+  volume, a redeploy resets to normal sizing — a safe, non-stuck default
+  guaranteed by boot reconciliation.
+
 ---
 
 ## 6. Trade Management

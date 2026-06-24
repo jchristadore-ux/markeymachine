@@ -27,9 +27,16 @@ Compares the current order book snapshot to the previous one for each ticker. Tr
 ### v5.3.0: Multi-Market Scanner
 Scans ALL open BTC markets across KXBTC15M/KXBTCD/KXBTC series and evaluates each for signals. The bot tries every valid market per cycle instead of just picking the one closest to 50c. Position guard and cooldown prevent over-trading.
 
-### Sizing — Flat Stake *(v9.4.1)*
+### Sizing — Flat Stake with Recovery Mode *(v9.5.0)*
 `f* = (b×p - q) / b` where b = net odds, p = OB win probability, q = 1-p.
-Kelly is now used **only as an edge gate** (`f* > 0` ⇒ positive expectancy). The stake is the **flat `TRADE_SIZE_DOLLARS` ($500) on every qualifying trade, regardless of balance** — no Kelly or balance-fraction down-scaling. The only clamp is cash on hand, so below a $500 balance the bot stakes whatever remains. `MAX_BET_FRACTION` no longer affects sizing. See the risk note in [`TRADING_DOCTRINE.md`](TRADING_DOCTRINE.md) §5 — flat sizing does not self-correct on drawdown.
+Kelly is used **only as an edge gate** (`f* > 0` ⇒ positive expectancy). The stake is **flat on every qualifying trade, regardless of balance** — no Kelly or balance-fraction down-scaling; the only clamp is cash on hand.
+
+The stake is **derived from a persistent mode** via `active_trade_size()`:
+
+- **Normal mode** → `NORMAL_TRADE_SIZE` (default $500; falls back to legacy `TRADE_SIZE_DOLLARS`).
+- **Recovery mode** → `RECOVERY_TRADE_SIZE` (default $100). Activated when a full-size trade settles a loss; the recovery target is the realized balance *immediately before that trade*. The bot trades at the reduced size until balance climbs back to the target, then auto-resumes full size.
+
+Recovery state `{active, target}` is persisted atomically and reconciled on boot, so it survives an in-container restart and can never wedge. See [`TRADING_DOCTRINE.md`](TRADING_DOCTRINE.md) §5 for the full lifecycle and edge-case guarantees. **For redeploy-durable recovery state on Railway, mount a Volume and set `RECOVERY_STATE_PATH` to a path on it.**
 
 ### Execution — Maker Limit Orders
 Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee. Takers pay ~1% of winnings. Fee drag on taker orders: ~$5+/day at scale.
@@ -45,6 +52,7 @@ A performance-driven overlay on the Kelly stake that scales trade size by a mult
 
 | Control | Behavior |
 |---|---|
+| **Recovery mode** *(v9.5.0)* | After a full-size loss, drops to `RECOVERY_TRADE_SIZE` until balance recovers to the pre-loss level, then auto-resumes `NORMAL_TRADE_SIZE`. Persistent across restarts |
 | **Streak filter** *(only active auto-hold)* | After `MAX_CONSEC_LOSSES` (3) consecutive losses, pauses trading for `STREAK_PAUSE_SECS` then resets the counter |
 | Session stop *(catastrophic backstop)* | Halts if balance drops below `SESSION_STOP_FRACTION` (40%) of session-start balance |
 | Position guard | One entry per market ticker, no re-entry until expiry |
@@ -138,7 +146,11 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `KALSHI_PRIVATE_KEY_PEM` | required | Full PEM. Replace newlines with `\n` if needed |
 | `DEMO_MODE` | `true` | Set `false` for live trading |
 | `TRADER_MODE` | `quant` | Only `quant` is recommended for live |
-| `TRADE_SIZE_DOLLARS` | `500` | Flat per-trade stake (v9.4.1). Fires at any balance; clamped only to cash on hand |
+| `NORMAL_TRADE_SIZE` | `TRADE_SIZE_DOLLARS` | Full-mode per-trade stake (v9.5.0). Defaults to `TRADE_SIZE_DOLLARS` so existing configs keep working |
+| `RECOVERY_TRADE_SIZE` | `100` | Reduced stake used while recovering a full-size loss (v9.5.0) |
+| `RECOVERY_STATE_PATH` | `recovery_state.json` | Where recovery state is persisted. Point at a mounted Railway **Volume** (e.g. `/data/recovery_state.json`) to survive redeploys |
+| `RECOVERY_PERSIST` | `true` | Set `false` to disable recovery-state persistence |
+| `TRADE_SIZE_DOLLARS` | `500` | Legacy flat stake; now the default for `NORMAL_TRADE_SIZE` |
 | `MAX_BET_FRACTION` | `1.0` | **Dead config (v9.4.1)** — flat sizing ignores it |
 | `SESSION_STOP_FRACTION` | `0.40` | Catastrophic backstop — halt below this fraction of session-start balance |
 | `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |

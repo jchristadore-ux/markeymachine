@@ -86,7 +86,7 @@ class TestLadderIntegration:
         bot.stake_ladder = lad
         # Large balance so the balance-fraction cap is not the binding limit.
         bet = bot.kelly_bet(0.65, 50, 100_000.0)
-        assert bet <= 2.0 * bot.TRADE_SIZE_CAP + 1e-9
+        assert bet <= 2.0 * bot.active_trade_size() + 1e-9
 
 
 class TestPostBootSettlementGate:
@@ -370,79 +370,69 @@ class TestCalcEdge:
 
 
 class TestKellyBet:
+    def setup_method(self):
+        # Sizing is now mode-derived; default every test to NORMAL mode.
+        bot.recovery.active         = False
+        bot.recovery.target_balance = 0.0
+
     def test_positive_edge_returns_bet(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 5.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 5.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.35)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.10)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         bet = bot.kelly_bet(0.70, 50, 25.0)
         assert bet > 0
         assert bet <= 5.0
 
     def test_no_edge_returns_zero(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 5.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 5.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.35)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.10)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         bet = bot.kelly_bet(0.30, 50, 25.0)
         assert bet == 0.0
 
     def test_capped_at_trade_size(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 2.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 2.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.50)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.50)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         bet = bot.kelly_bet(0.90, 40, 100.0)
         assert bet <= 2.0
 
-    def test_recovery_no_longer_shrinks_stake(self, monkeypatch):
-        """v9.4.0: RECOVERY mode was removed — session state must not alter size."""
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 100.0)
-        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.50)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
-        bet_active = bot.kelly_bet(0.70, 50, 100.0)
-        monkeypatch.setattr(bot, "session_state", SessionState.RECOVERY)
-        bet_recovery = bot.kelly_bet(0.70, 50, 100.0)
-        assert bet_recovery == bet_active
-
     def test_flat_500_on_large_bankroll(self, monkeypatch):
         """v9.4.1: flat $500 stake on any positive-edge trade at a high balance."""
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         assert bot.kelly_bet(0.90, 40, 5000.0) == 500.0
 
     def test_flat_500_fires_regardless_of_balance(self, monkeypatch):
         """v9.4.1: a modest-edge trade on a small (but ≥$500) balance still
         stakes the full $500 — no Kelly/balance down-scaling."""
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         assert bot.kelly_bet(0.70, 50, 600.0) == 500.0
 
     def test_clamped_to_cash_when_balance_below_stake(self, monkeypatch):
         """v9.4.1: the only clamp is cash on hand — below $500 the bot goes all-in."""
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         assert bot.kelly_bet(0.70, 50, 300.0) == 300.0
 
+    def test_recovery_mode_uses_recovery_size(self, monkeypatch):
+        """v9.5.0: while recovery is active, sizing derives from RECOVERY_TRADE_SIZE."""
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        bot.recovery.active = True
+        assert bot.kelly_bet(0.90, 40, 5000.0) == 100.0
+
     def test_boundary_prices(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 5.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 5.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.35)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.10)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         assert bot.kelly_bet(0.70, 0, 25.0) == 0.0
         assert bot.kelly_bet(0.70, 100, 25.0) == 0.0
 
     def test_bet_fraction_no_longer_caps(self, monkeypatch):
         """v9.4.1: MAX_BET_FRACTION is dead config — flat sizing ignores it.
-        A small fraction must NOT shrink the stake below TRADE_SIZE_CAP."""
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        A small fraction must NOT shrink the stake below NORMAL_TRADE_SIZE."""
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
         monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)  # would have capped at $40
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
         assert bot.kelly_bet(0.90, 40, 1_000.0) == 500.0
 
 
@@ -1068,3 +1058,179 @@ class TestUpdateSessionState:
         bot.session_state = SessionState.ACTIVE
         bot.update_session_state(1990.0)  # tiny loss
         assert bot.session_state == SessionState.ACTIVE
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v9.5.0: RECOVERY MODE (two-tier sizing)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestRecoveryState:
+    """Unit tests for the persistent RecoveryState transitions, in isolation
+    from the module-level singleton (persist=False, no disk I/O)."""
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def _rs(self):
+        return bot.RecoveryState(path="unused.json", persist=False)
+
+    def test_enter_sets_target_and_active(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        assert rs.enter(target_balance=10_000.0, current_balance=9_500.0) is True
+        assert rs.active is True
+        assert rs.target_balance == 10_000.0
+
+    def test_enter_noop_when_already_active(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        rs.enter(10_000.0, 9_500.0)
+        # A second (deeper) loss must NOT move the target.
+        assert rs.enter(9_500.0, 9_000.0) is False
+        assert rs.target_balance == 10_000.0
+
+    def test_enter_noop_when_already_at_target(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        # Nothing to recover if balance already ≥ target.
+        assert rs.enter(10_000.0, 10_000.0) is False
+        assert rs.active is False
+
+    def test_enter_rejects_bad_target(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        assert rs.enter(0.0, 9_500.0) is False
+        assert rs.enter(None, 9_500.0) is False
+        assert rs.active is False
+
+    def test_maybe_exit_below_target_stays(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        rs.enter(10_000.0, 9_500.0)
+        assert rs.maybe_exit(9_999.99) is False
+        assert rs.active is True
+
+    def test_maybe_exit_at_target_exits(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        rs.enter(10_000.0, 9_500.0)
+        assert rs.maybe_exit(10_000.0) is True   # >= is the boundary
+        assert rs.active is False
+        assert rs.target_balance == 0.0
+
+    def test_maybe_exit_noop_when_inactive(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        assert rs.maybe_exit(10_000.0) is False
+
+    def test_reconcile_clears_when_already_recovered(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        rs.active = True
+        rs.target_balance = 10_000.0
+        rs.reconcile_on_boot(10_500.0)  # came back up while bot was down
+        assert rs.active is False
+
+    def test_reconcile_resumes_when_still_below(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        rs.active = True
+        rs.target_balance = 10_000.0
+        rs.reconcile_on_boot(9_600.0)
+        assert rs.active is True
+        assert rs.target_balance == 10_000.0
+
+    def test_reconcile_clears_corrupt_target(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rs = self._rs()
+        rs.active = True
+        rs.target_balance = 0.0
+        rs.reconcile_on_boot(9_600.0)
+        assert rs.active is False
+
+    def test_persistence_round_trip(self, monkeypatch, tmp_path):
+        self._no_telegram(monkeypatch)
+        path = str(tmp_path / "recovery_state.json")
+        rs1 = bot.RecoveryState(path=path, persist=True)
+        rs1.enter(10_000.0, 9_500.0)
+        # A fresh instance loads the persisted state (survives process restart).
+        rs2 = bot.RecoveryState(path=path, persist=True)
+        assert rs2.active is True
+        assert rs2.target_balance == 10_000.0
+        rs1.maybe_exit(10_000.0)
+        rs3 = bot.RecoveryState(path=path, persist=True)
+        assert rs3.active is False
+
+
+class TestActiveTradeSize:
+    def setup_method(self):
+        bot.recovery.active = False
+        bot.recovery.target_balance = 0.0
+
+    def test_normal_size_when_inactive(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        assert bot.active_trade_size() == 500.0
+
+    def test_recovery_size_when_active(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        bot.recovery.active = True
+        assert bot.active_trade_size() == 100.0
+
+
+class TestOnTradeSettledRecoveryEntry:
+    """The settlement hook: only a normal-mode (full-size) loss arms recovery."""
+
+    def setup_method(self):
+        bot.recovery.active = False
+        bot.recovery.target_balance = 0.0
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def test_full_size_loss_activates(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rec = {"mode_at_entry": "normal", "balance_before": 10_000.0}
+        bot.on_trade_settled(won=False, trade_rec=rec, current_balance=9_500.0)
+        assert bot.recovery.active is True
+        assert bot.recovery.target_balance == 10_000.0
+
+    def test_win_does_not_activate(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rec = {"mode_at_entry": "normal", "balance_before": 10_000.0}
+        bot.on_trade_settled(won=True, trade_rec=rec, current_balance=10_500.0)
+        assert bot.recovery.active is False
+
+    def test_recovery_size_loss_does_not_activate(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        rec = {"mode_at_entry": "recovery", "balance_before": 9_400.0}
+        bot.on_trade_settled(won=False, trade_rec=rec, current_balance=9_300.0)
+        assert bot.recovery.active is False
+
+    def test_loss_while_already_recovering_keeps_target(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        bot.recovery.active = True
+        bot.recovery.target_balance = 10_000.0
+        rec = {"mode_at_entry": "recovery", "balance_before": 9_400.0}
+        bot.on_trade_settled(won=False, trade_rec=rec, current_balance=9_300.0)
+        assert bot.recovery.target_balance == 10_000.0
+
+    def test_missing_fields_do_not_activate(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        # Pre-upgrade / unattributable trades have no mode_at_entry.
+        bot.on_trade_settled(won=False, trade_rec={}, current_balance=9_500.0)
+        assert bot.recovery.active is False
+
+    def test_full_cycle_enter_then_exit(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        # 1) full-size loss → recovery on, target = pre-trade balance
+        rec = {"mode_at_entry": "normal", "balance_before": 10_000.0}
+        bot.on_trade_settled(won=False, trade_rec=rec, current_balance=9_500.0)
+        assert bot.recovery.active is True
+        # 2) balance climbs back at reduced size but not yet to target
+        assert bot.recovery.maybe_exit(9_800.0) is False
+        assert bot.recovery.active is True
+        # 3) balance reaches target → auto-resume normal
+        assert bot.recovery.maybe_exit(10_000.0) is True
+        assert bot.recovery.active is False

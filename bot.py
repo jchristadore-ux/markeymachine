@@ -1,7 +1,28 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.4.1  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.5.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.5.0 — RECOVERY MODE: two-tier position sizing (owner directive).         ║
+║                                                                              ║
+║  After a FULL-SIZE (normal-mode) trade settles a LOSS, the bot drops from    ║
+║  NORMAL_TRADE_SIZE to RECOVERY_TRADE_SIZE and sets a recovery target = the    ║
+║  realized balance recorded IMMEDIATELY BEFORE that losing trade. It keeps     ║
+║  trading at the reduced size until the realized balance climbs back to the    ║
+║  target, then auto-resumes full size. State {active, target} is persisted to  ║
+║  RECOVERY_STATE_PATH (atomic JSON) and reconciled on boot, so an in-container ║
+║  restart resumes mid-recovery and can never wedge.                           ║
+║                                                                              ║
+║  Sizing is derived from the mode via active_trade_size() — never read raw    ║
+║  from a single env var at the sizing call. Entry is event-driven (a settled  ║
+║  full-size loss → exact pre-trade target); exit is balance-driven and checked ║
+║  every cycle AND on boot. A further loss while already recovering does NOT    ║
+║  move the target. Entry filters / halts / streak logic unchanged.            ║
+║                                                                              ║
+║  RAILWAY: NORMAL_TRADE_SIZE (defaults to TRADE_SIZE_DOLLARS, so existing      ║
+║  configs keep working), RECOVERY_TRADE_SIZE (default 100). For redeploy-      ║
+║  durable recovery state, mount a Railway Volume and set RECOVERY_STATE_PATH   ║
+║  to a path on it (e.g. /data/recovery_state.json).                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.4.1 — FLAT $500 STAKE (owner directive): $500 trades fire regardless of  ║
 ║  balance.                                                                    ║
@@ -217,9 +238,10 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.4.1"
+BOT_VERSION = "9.5.0"
 
 import base64
+import json
 import logging
 import math
 import os
@@ -306,13 +328,32 @@ DEMO_MODE           = _env_bool("DEMO_MODE", True)
 POLL_INTERVAL       = _env_int("POLL_INTERVAL_SECS", 30)
 
 # ── Capital & sizing ──────────────────────────────────────────────────────────
-TRADE_SIZE_CAP      = _env_float("TRADE_SIZE_DOLLARS", 5.0)
+# v9.5.0: two-tier sizing driven by a persistent Recovery Mode (see RecoveryState
+# below). The ACTIVE stake is derived from the current mode, never read raw from
+# a single env var at the sizing call:
+#   • NORMAL_TRADE_SIZE   — the full stake in normal operation.
+#   • RECOVERY_TRADE_SIZE — the reduced stake while clawing back a full-size loss.
+# NORMAL_TRADE_SIZE falls back to the legacy TRADE_SIZE_DOLLARS so existing
+# Railway configs keep working unchanged.
+NORMAL_TRADE_SIZE   = _env_float("NORMAL_TRADE_SIZE", _env_float("TRADE_SIZE_DOLLARS", 5.0))
+RECOVERY_TRADE_SIZE = _env_float("RECOVERY_TRADE_SIZE", 100.0)
 # v9.1.0: 0.08 → 0.04. At 8% of bankroll per binary bet, an ordinary 4-loss
 # streak costs ~12.5% of the account in one session (2026-06-18: −$246.87 on
 # 1W/4L). Halving the per-bet fraction bounds a cold-streak session.
 MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.04)
 KELLY_FRACTION      = _env_float("KELLY_FRACTION", 0.30)
 KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
+
+# ── Recovery Mode persistence ─────────────────────────────────────────────────
+# Where the recovery state (active flag + target balance) is written so it
+# survives an in-container process restart. NOTE: Railway's container filesystem
+# is ephemeral across REDEPLOYS — mount a Railway Volume and point
+# RECOVERY_STATE_PATH at it (e.g. /data/recovery_state.json) for the state to
+# survive a redeploy. Without a Volume, a redeploy resets to NORMAL sizing
+# (boot reconciliation makes this a safe, non-stuck default).
+RECOVERY_STATE_PATH = os.environ.get("RECOVERY_STATE_PATH", "recovery_state.json")
+RECOVERY_PERSIST    = _env_bool("RECOVERY_PERSIST", True)
+
 
 # ── Laddering stake overlay (opt-in) ──────────────────────────────────────────
 # Scales the Kelly stake by a performance-driven multiplier (0.5x–2x). Disabled
@@ -561,6 +602,160 @@ _live_prior: float = OB_BASE_ACCURACY
 # Laddering stake overlay — only instantiated when LADDER_ENABLED. Sized as a
 # multiplier on top of the Kelly stake; respects every existing cap.
 stake_ladder: Optional[StakeLadder] = StakeLadder() if LADDER_ENABLED else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECOVERY MODE  (two-tier position sizing — v9.5.0)
+#
+# After a FULL-SIZE (normal-mode) trade settles a LOSS, the bot drops to a
+# reduced RECOVERY_TRADE_SIZE until the account balance climbs back to where it
+# was IMMEDIATELY BEFORE that losing trade. Then it returns to NORMAL_TRADE_SIZE
+# automatically. The state (active flag + recovery target balance) is persisted
+# to disk so an in-container restart resumes mid-recovery.
+#
+# Design guarantees (see also the edge-case notes in TRADING_DOCTRINE.md §6):
+#   • Entry is event-driven (a settled full-size loss), so the target is the
+#     exact recorded pre-trade balance — never reconstructed from PnL.
+#   • Exit is balance-driven and checked every cycle AND on boot, so the bot can
+#     never wedge in recovery once balance reaches the target even once.
+#   • enter() is a no-op while already active → a further loss never moves the
+#     target (the goal stays the original pre-loss balance).
+#   • Single-threaded loop → mutate-then-persist is atomic w.r.t. sizing reads;
+#     there is no race and no per-cycle oscillation (entry needs a settlement).
+# This `recovery` object is mutated IN-PLACE only and must NEVER be reassigned
+# (so it never appears in a function `global` statement — same rule as the other
+# module-level mutable containers above).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RecoveryState:
+    """Persistent two-tier sizing mode. Owns {active, target_balance}."""
+
+    SCHEMA = 1
+
+    def __init__(self, path: str, persist: bool) -> None:
+        self.active:         bool  = False
+        self.target_balance: float = 0.0
+        self._path    = path
+        self._persist = persist
+        if self._persist:
+            self._load()
+
+    # ── transitions ──────────────────────────────────────────────────────────
+    def enter(self, target_balance: float, current_balance: float) -> bool:
+        """Activate recovery with the given target. No-op if already active or
+        the target is not a usable, not-already-met value. Returns True on a
+        real activation."""
+        if self.active:
+            return False
+        if target_balance is None or target_balance <= 0.0:
+            return False
+        # If we are somehow already at/above the target, there is nothing to
+        # recover — stay in normal mode rather than enter-then-instantly-exit.
+        if current_balance >= target_balance:
+            return False
+        self.active         = True
+        self.target_balance = round(float(target_balance), 2)
+        self._save()
+        log.warning("Recovery mode ACTIVATED after losing full-size trade.")
+        log.warning("Previous balance: $%.2f", self.target_balance)
+        log.warning("Recovery target: $%.2f", self.target_balance)
+        log.warning("Switching trade size to: $%.2f", RECOVERY_TRADE_SIZE)
+        tg.send_telegram_message(
+            f"🛟 RECOVERY MODE ACTIVATED\n"
+            f"Recovery target: ${self.target_balance:.2f}\n"
+            f"Trade size → ${RECOVERY_TRADE_SIZE:.2f} (was ${NORMAL_TRADE_SIZE:.2f})"
+        )
+        return True
+
+    def maybe_exit(self, current_balance: float) -> bool:
+        """Deactivate recovery once balance has recovered to the target. Checked
+        every cycle and on boot. Returns True on a real deactivation."""
+        if not self.active:
+            return False
+        if current_balance < self.target_balance:
+            return False
+        reached = self.target_balance
+        self.active         = False
+        self.target_balance = 0.0
+        self._save()
+        log.warning("Recovery target reached.")
+        log.warning("Recovery mode DEACTIVATED.")
+        log.warning("Switching trade size back to: $%.2f", NORMAL_TRADE_SIZE)
+        tg.send_telegram_message(
+            f"✅ RECOVERY COMPLETE — balance ${current_balance:.2f} ≥ target "
+            f"${reached:.2f}\nTrade size → ${NORMAL_TRADE_SIZE:.2f}"
+        )
+        return True
+
+    def reconcile_on_boot(self, current_balance: float) -> None:
+        """Self-heal persisted state at startup so the bot can never resume into
+        a stuck or nonsensical recovery."""
+        if not self.active:
+            return
+        if self.target_balance <= 0.0:
+            log.warning("Recovery boot │ corrupt target $%.2f — clearing.",
+                        self.target_balance)
+            self.active = False
+            self._save()
+            return
+        if current_balance >= self.target_balance:
+            log.info("Recovery boot │ balance $%.2f already ≥ target $%.2f — "
+                     "exiting recovery.", current_balance, self.target_balance)
+            self.maybe_exit(current_balance)
+            return
+        log.warning("Recovery boot │ RESUMING recovery. Balance $%.2f, target "
+                    "$%.2f, trade size $%.2f.",
+                    current_balance, self.target_balance, RECOVERY_TRADE_SIZE)
+
+    def status_line(self, current_balance: float) -> str:
+        return (f"Recovery mode active. Current balance: ${current_balance:.2f}. "
+                f"Target: ${self.target_balance:.2f}. "
+                f"Trade size: ${RECOVERY_TRADE_SIZE:.2f}.")
+
+    # ── persistence (atomic JSON write) ────────────────────────────────────────
+    def _save(self) -> None:
+        if not self._persist:
+            return
+        try:
+            tmp = f"{self._path}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "schema":         self.SCHEMA,
+                    "active":         self.active,
+                    "target_balance": self.target_balance,
+                }, f)
+            os.replace(tmp, self._path)   # atomic on POSIX
+        except OSError as e:
+            log.warning("Recovery │ state save failed: %s", e)
+
+    def _load(self) -> None:
+        try:
+            with open(self._path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return
+        self.active         = bool(d.get("active", False))
+        self.target_balance = float(d.get("target_balance", 0.0) or 0.0)
+
+
+recovery = RecoveryState(RECOVERY_STATE_PATH, RECOVERY_PERSIST)
+
+
+def active_trade_size() -> float:
+    """The dollar stake for the current mode. Single source of truth for sizing
+    — every position-sizing path derives from this, not from a raw env var."""
+    return RECOVERY_TRADE_SIZE if recovery.active else NORMAL_TRADE_SIZE
+
+
+def on_trade_settled(won: bool, trade_rec: dict, current_balance: float) -> None:
+    """Recovery ENTRY hook, called once per settled trade. Activates recovery
+    only when a normal-mode (full-size) trade loses and we are not already in
+    recovery; the target is the balance recorded just before that trade."""
+    if won or recovery.active:
+        return
+    if (trade_rec or {}).get("mode_at_entry") != "normal":
+        return  # recovery-mode losses and un-attributable trades never trigger
+    recovery.enter((trade_rec or {}).get("balance_before"), current_balance)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1026,17 +1221,20 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
     full_kelly = max(0.0, (b * win_prob - (1.0 - win_prob)) / b)
     # v9.4.1 (owner directive): FLAT stake. Kelly is used ONLY as an edge gate —
     # a positive full_kelly means the bet has positive expectancy. The stake size
-    # itself is the full TRADE_SIZE_CAP regardless of balance (no Kelly or
-    # MAX_BET_FRACTION down-scaling), so $500 trades fire at any bankroll. The
-    # only clamp is the cash on hand: you cannot stake more than the account holds.
+    # itself is the full active trade size regardless of balance (no Kelly or
+    # MAX_BET_FRACTION down-scaling), so trades fire at any bankroll. The only
+    # clamp is the cash on hand: you cannot stake more than the account holds.
+    # v9.5.0: the stake is derived from the current mode via active_trade_size()
+    # (NORMAL_TRADE_SIZE normally, RECOVERY_TRADE_SIZE while in recovery).
     if full_kelly <= 0.0:
         return 0.0
-    base_bet = round(min(TRADE_SIZE_CAP, balance), 2)
+    size     = active_trade_size()
+    base_bet = round(min(size, balance), 2)
 
     # Laddering overlay (opt-in). Scales the flat stake by a performance
-    # multiplier, but never past 2× the trade-size cap or the cash on hand.
+    # multiplier, but never past 2× the active trade size or the cash on hand.
     if stake_ladder is not None:
-        ceiling  = min(stake_ladder.cfg.max_multiplier * TRADE_SIZE_CAP, balance)
+        ceiling  = min(stake_ladder.cfg.max_multiplier * size, balance)
         decision = stake_ladder.get_stake(base_bet, max_stake=ceiling)
         return decision.stake
 
@@ -1348,6 +1546,10 @@ def resolve_open_orders() -> None:
                 )
 
             ladder_record(won, trade_pnl)
+            # Recovery ENTRY hook: a full-size loss arms recovery (uses this
+            # trade's recorded pre-trade balance as the target). paper_balance is
+            # already updated above for this settlement.
+            on_trade_settled(won, trade, paper_balance)
 
             log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
                      ticker[-15:], side, result.upper(), sim, paper_balance)
@@ -1468,6 +1670,9 @@ def resolve_open_orders() -> None:
                     streak_pause_until = time.time() + STREAK_PAUSE_SECS
 
             ladder_record(won, pnl)
+            # Recovery ENTRY hook: `balance` was fetched (realized) above for
+            # this settled trade.
+            on_trade_settled(won, trade, balance)
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",
@@ -1670,7 +1875,8 @@ def streak_check() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def place_order(ticker: str, direction: str, bet_dollars: float,
-                limit_cents: int, win_prob: float, edge: float) -> Optional[str]:
+                limit_cents: int, win_prob: float, edge: float,
+                balance_before: float = 0.0) -> Optional[str]:
     global last_trade_ts, paper_balance
 
     if limit_cents <= 0:
@@ -1682,6 +1888,10 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
     cost      = (limit_cents * count) / 100.0
     client_id = f"mm-{uuid.uuid4().hex[:10]}"
     btc_entry = list(btc_prices)[-1] if btc_prices else 0
+    # v9.5.0: stamp the sizing mode + the realized balance immediately BEFORE
+    # this trade so settlement can (a) tell a full-size loss from a recovery-size
+    # loss and (b) set the recovery target to the exact pre-trade balance.
+    entry_mode = "recovery" if recovery.active else "normal"
 
     if DEMO_MODE:
         paper_balance -= cost
@@ -1694,6 +1904,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
             "price": limit_cents, "count": count, "cost": cost,
             "order_id": client_id, "result": "pending",
             "placed_at": time.time(), "btc_entry_price": btc_entry,
+            "mode_at_entry": entry_mode, "balance_before": round(balance_before, 2),
         }
         trade_history.append(rec)
         open_orders[client_id] = rec
@@ -1735,6 +1946,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
             "price": limit_cents, "count": count, "cost": cost,
             "order_id": order_id, "result": "pending",
             "placed_at": time.time(), "btc_entry_price": btc_entry,
+            "mode_at_entry": entry_mode, "balance_before": round(balance_before, 2),
         }
         trade_history.append(rec)
         open_orders[order_id] = rec
@@ -1769,7 +1981,10 @@ def telegram_boot(balance: float) -> None:
         f"🤖 MarkeyMachine {BOT_VERSION} STARTED\n"
         f"{mode} │ State: {session_state.value}\n"
         f"Balance: ${balance:.2f}\n"
-        f"TradeCap=${TRADE_SIZE_CAP:.0f} | MaxConsecL={MAX_CONSEC_LOSSES}\n"
+        f"Size=${active_trade_size():.0f} "
+        f"(normal=${NORMAL_TRADE_SIZE:.0f}/recovery=${RECOVERY_TRADE_SIZE:.0f}"
+        f"{' • RECOVERING→$%.0f' % recovery.target_balance if recovery.active else ''}) | "
+        f"MaxConsecL={MAX_CONSEC_LOSSES}\n"
         f"MinConf={MIN_CONFIDENCE} | MinWinP={MIN_WIN_PROB*100:.0f}% | R²≥{R2_TREND_THRESHOLD}\n"
         f"OBDepth≥${MIN_OB_DEPTH:.0f} | OBImb≥{OB_IMBALANCE_THRESH*100:.0f}%\n"
         f"AGREE-gate={'ON' if REQUIRE_AGREE_MOMENTUM else 'OFF'} | "
@@ -1978,7 +2193,10 @@ def run_decision(market: dict, balance: float) -> None:
     )
 
     last_signal_desc = f"SIGNAL {direction} conf={conf:.0f} p={win_prob:.2f}"
-    place_order(ticker, direction, bet, limit_price, win_prob, edge)
+    # balance_before = the realized balance for this cycle (fetched before any
+    # order cost is debited) → the exact recovery target if this trade loses.
+    place_order(ticker, direction, bet, limit_price, win_prob, edge,
+                balance_before=balance)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2072,8 +2290,11 @@ def main() -> None:
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
     log.info("  Momentum lookback=%d intervals | thresh≥%.2f%% or R²≥%.2f",
              MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
-    log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d",
-             KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
+    log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
+             NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
+             " (RECOVERY active, target $%.2f)" % recovery.target_balance
+             if recovery.active else "")
+    log.info("  Kelly=%.2f | SessionScore≥%d", KELLY_FRACTION, MIN_SESSION_SCORE)
     log.info("━" * 70)
 
     tg.validate_telegram_connection()
@@ -2086,6 +2307,7 @@ def main() -> None:
         running_pnl            = 0.0
         session_start_balance  = paper_balance
         session_stop_threshold = paper_balance * SESSION_STOP_FRACTION
+        recovery.reconcile_on_boot(paper_balance)
         telegram_boot(paper_balance)
     else:
         try:
@@ -2106,6 +2328,7 @@ def main() -> None:
         consecutive_losses = 0
         running_pnl        = 0.0
         live_daily_realized = 0.0
+        recovery.reconcile_on_boot(bal)
         telegram_boot(bal)
 
     resolve_cycle = 0
@@ -2154,6 +2377,9 @@ def main() -> None:
             current_balance = paper_balance if DEMO_MODE else get_live_balance()
             maybe_roll_session_day(current_balance)
             update_session_state(current_balance)
+            # Recovery EXIT check runs every cycle, independent of trading, so
+            # the bot can never wedge in recovery once balance reaches target.
+            recovery.maybe_exit(current_balance)
             run_decision(market, current_balance)
 
             resolve_cycle += 1
@@ -2192,6 +2418,9 @@ def main() -> None:
                             and time.time() - last_daily_summary_ts > 3600):
                         last_daily_summary_ts = time.time()
                         telegram_daily_summary(live_bal, daily_pnl, live_wins, live_losses)
+
+                if recovery.active:
+                    log.info(recovery.status_line(current_balance))
 
             time.sleep(POLL_INTERVAL)
 
