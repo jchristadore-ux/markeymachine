@@ -545,10 +545,14 @@ class TestComputeMomentum:
         verdict, adj = bot.compute_momentum("YES")
         assert verdict == "CONFLICT"
 
-    def test_neutral_flat(self, monkeypatch):
+    def test_neutral_choppy(self, monkeypatch):
+        # v9.3.3: NEUTRAL now means genuinely directionless BTC — BOTH low
+        # regression R² AND sub-threshold magnitude. A symmetric zigzag (net ~0%,
+        # slope ~0, R²≈0) is the chop the doctrine rejects.
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
-        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
-        for p in [50000, 50010, 50020, 50030, 50040]:
+        monkeypatch.setattr(bot, "MOMENTUM_R2_MIN", 0.55)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
+        for p in [50000, 50060, 50000, 49940, 50000, 50060, 50000]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
         assert verdict == "NEUTRAL"
@@ -563,42 +567,61 @@ class TestComputeMomentum:
 
     def test_neutral_adj_is_negative(self, monkeypatch):
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
-        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
+        monkeypatch.setattr(bot, "MOMENTUM_R2_MIN", 0.55)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
         monkeypatch.setattr(bot, "NEUTRAL_ACCURACY_DRAG", 0.02)
-        for p in [50000, 50010, 50020, 50030, 50040]:
+        for p in [50000, 50060, 50000, 49940, 50000, 50060, 50000]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
+        assert verdict == "NEUTRAL"
         assert adj == -0.02
 
     def test_lookback_default_needs_more_samples(self, monkeypatch):
-        # v9.3.2 regression: at the default lookback (6) a 5-price series is one
-        # sample short, so momentum cannot yet be measured.
+        # At the default lookback (6) a 5-price series is one sample short, so
+        # momentum cannot yet be measured.
         monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
         for p in [50000, 50050, 50100, 50200, 50300]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
         assert verdict == "NEUTRAL"
 
-    def test_gentle_trend_now_agrees(self, monkeypatch):
-        # v9.3.2 regression for the 2026-06-23 "zero trades" bug. A clean,
-        # gentle ~0.3% uptrend over 12 samples (~6 min) in which NO single
-        # 90s/3-sample slice moves ≥0.15% used to read NEUTRAL and block every
-        # trade. With the default 6-interval lookback the wider window clears
-        # the 0.15% threshold and momentum correctly AGREES.
+    def test_gentle_consistent_trend_agrees_via_r2(self, monkeypatch):
+        # v9.3.3 regression for the 2026-06-24 "zero trades" bug. A clean, gentle
+        # uptrend whose magnitude stays BELOW MOMENTUM_THRESH_PCT but is highly
+        # consistent (R²≈1) used to read NEUTRAL and block every trade. The R²
+        # path now recognizes it as a real trend and AGREES.
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_R2_MIN", 0.55)
         monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
-        # +25/step → +0.05% per 90s slice (< thresh), but +0.30% over 6 slices.
-        prices = [50000 + 25 * i for i in range(12)]
-        for p in prices:
+        # +8/step over 6 steps → +0.096% net (< 0.15% thresh), perfectly linear.
+        for p in [50000 + 8 * i for i in range(7)]:
             bot.btc_prices.append(p)
-        # old 3-sample window would have been NEUTRAL...
-        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 3)
-        assert bot.compute_momentum("YES")[0] == "NEUTRAL"
-        # ...new 6-sample window AGREES on the same data.
-        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
         verdict, adj = bot.compute_momentum("YES")
         assert verdict == "AGREE"
         assert adj > 0
+
+    def test_gentle_consistent_trend_conflicts_against_ob(self, monkeypatch):
+        # Same gentle-but-consistent trend, opposite OB side → CONFLICT (the
+        # slope direction disagrees with the order book).
+        monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_R2_MIN", 0.55)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
+        for p in [50000 + 8 * i for i in range(7)]:
+            bot.btc_prices.append(p)
+        verdict, adj = bot.compute_momentum("NO")
+        assert verdict == "CONFLICT"
+
+    def test_r2_path_disabled_restores_magnitude(self, monkeypatch):
+        # Setting MOMENTUM_R2_MIN=2.0 disables the R² path: the same gentle trend
+        # falls back to pure magnitude and (being sub-threshold) reads NEUTRAL,
+        # i.e. the pre-9.3.3 behavior is recoverable via env.
+        monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_R2_MIN", 2.0)
+        monkeypatch.setattr(bot, "MOMENTUM_LOOKBACK", 6)
+        for p in [50000 + 8 * i for i in range(7)]:
+            bot.btc_prices.append(p)
+        verdict, adj = bot.compute_momentum("YES")
+        assert verdict == "NEUTRAL"
 
 
 class TestRegimeAgreement:

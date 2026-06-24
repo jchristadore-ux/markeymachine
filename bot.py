@@ -1,7 +1,25 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.3.2  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.3.3  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.3.3 — MOMENTUM R² ALIGNMENT: magnitude gate still mislabeled trends.     ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-24 LIVE, v9.3.2): still ZERO trades. 13 cycles reached   ║
+║  the gate fully aligned (e.g. KXBTC15M-...1815 climbing 74→83¢, regime       ║
+║  TRENDING_UP R²=0.74–0.92, OB YES 77–97%) yet momentum returned NEUTRAL on   ║
+║  every one. Root cause is structural, not the window: compute_regime() flags ║
+║  TRENDING by R² (trend CONSISTENCY), but compute_momentum() required raw     ║
+║  %-MAGNITUDE ≥0.15%/3min. A smooth, gentle drift has high R² but a small     ║
+║  %-move, so it passes regime and fails momentum. Widening 3→6 (v9.3.2) was   ║
+║  not enough; 0.15%/3min is a large move for the calm trends in these books.  ║
+║                                                                              ║
+║  FIX: momentum now treats a trend as REAL when EITHER the regression R² over ║
+║  its window ≥ MOMENTUM_R2_MIN (default 0.55) OR the magnitude clears         ║
+║  MOMENTUM_THRESH_PCT — and takes DIRECTION from the regression slope, like   ║
+║  compute_regime(). BTC is "flat"/NEUTRAL only when BOTH inconsistent (low    ║
+║  R²) AND small (sub-threshold) — genuine chop the doctrine still rejects.    ║
+║  Set MOMENTUM_R2_MIN=2.0 to restore pure-magnitude (v9.3.2) behavior.        ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.3.2 — MOMENTUM WINDOW FIX: the AGREE gate was unsatisfiable, 0 trades.   ║
 ║                                                                              ║
@@ -155,7 +173,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.3.2"
+BOT_VERSION = "9.3.3"
 
 import base64
 import logging
@@ -298,6 +316,14 @@ MOMENTUM_THRESH_PCT   = _env_float("MOMENTUM_THRESH_PCT", 0.15)
 # at the 30s poll) confirms real trends without firing on 90s chop. Set to 3 to
 # restore the pre-9.3.2 window.
 MOMENTUM_LOOKBACK     = _env_int("MOMENTUM_LOOKBACK", 6)
+# v9.3.3: a trend is "real" for momentum when EITHER the linear regression over
+# the momentum window is consistent (local R² ≥ this) OR the magnitude clears
+# MOMENTUM_THRESH_PCT. This aligns momentum's trend test with compute_regime's
+# R²-based one: a smooth, gentle BTC drift has high R² but a small %-move, so the
+# pure-magnitude gate kept mislabeling it NEUTRAL and blocked EVERY trade even
+# after v9.3.2 (2026-06-23/24: 0 trades). Set to 2.0 to disable the R² path and
+# restore pure-magnitude (pre-9.3.3) behavior.
+MOMENTUM_R2_MIN       = _env_float("MOMENTUM_R2_MIN", 0.55)
 MIN_EDGE_PCT          = _env_float("MIN_EDGE_PCT", 0.06)
 MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 65)
 MIN_WIN_PROB          = _env_float("MIN_WIN_PROB", 0.60)
@@ -644,17 +670,34 @@ def compute_momentum(ob_direction: str) -> Tuple[str, float]:
     if len(btc_prices) < MOMENTUM_LOOKBACK + 1:
         return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
 
-    prices  = list(btc_prices)
-    recent  = prices[-1]
-    earlier = prices[-(MOMENTUM_LOOKBACK + 1)]
+    window  = list(btc_prices)[-(MOMENTUM_LOOKBACK + 1):]
+    earlier = window[0]
+    recent  = window[-1]
     if earlier <= 0:
         return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
 
     move_pct = (recent - earlier) / earlier * 100.0
-    btc_dir  = "YES" if move_pct > 0 else ("NO" if move_pct < 0 else "FLAT")
+    slope, _, local_r2 = _linear_regression(window)
     ob_dir   = ob_direction.upper()
 
-    if abs(move_pct) < MOMENTUM_THRESH_PCT:
+    # v9.3.3: a trend is REAL when BTC moves CONSISTENTLY (regression R² over the
+    # momentum window) OR far enough in MAGNITUDE. compute_regime() flags TRENDING
+    # by R² alone, so a smooth, gentle drift (high R², small %-move) is genuinely
+    # trending — but the old pure-magnitude test mislabeled it NEUTRAL and the
+    # AGREE gate blocked every trade (2026-06-23/24: 0 trades). BTC is "flat" only
+    # when it is BOTH inconsistent (low R²) AND small (sub-threshold) — the chop
+    # the doctrine rejects. This keeps that guarantee while confirming real trends.
+    is_trending = (local_r2 >= MOMENTUM_R2_MIN) or (abs(move_pct) >= MOMENTUM_THRESH_PCT)
+    if not is_trending:
+        return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
+
+    # Direction from the regression slope (consistent with compute_regime), with
+    # the endpoint delta as a tiebreaker when the slope is exactly flat.
+    if slope > 0 or (slope == 0 and move_pct > 0):
+        btc_dir = "YES"
+    elif slope < 0 or (slope == 0 and move_pct < 0):
+        btc_dir = "NO"
+    else:
         return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
 
     if btc_dir == ob_dir:
@@ -2064,8 +2107,8 @@ def main() -> None:
     log.info("  AGREE-gate=%s | MinConf=%d | Breakeven≤%dc | NEUTRALdrag=%.3f",
              "ON" if REQUIRE_AGREE_MOMENTUM else "OFF",
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
-    log.info("  Momentum lookback=%d intervals | thresh≥%.2f%%",
-             MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT)
+    log.info("  Momentum lookback=%d intervals | thresh≥%.2f%% or R²≥%.2f",
+             MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
     log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d",
              KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
     log.info("━" * 70)
