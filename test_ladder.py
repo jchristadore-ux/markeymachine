@@ -228,6 +228,48 @@ class TestStakeLadder:
         d = lad.get_stake(5.0)
         assert d.multiplier > 1.0
 
+    def test_pause_size_up_holds_baseline_then_resumes(self):
+        clk = FakeClock()
+        lad = make_ladder(clock=clk, min_trades=5, window=20, cooldown_secs=0)
+        # Build a hot record so the ladder WOULD size up.
+        for _ in range(9):
+            lad.on_trade_result(True, 2.0)
+            clk.advance(60)
+        assert lad.get_stake(5.0).multiplier > 1.0      # hot → would size up
+
+        lad.pause_size_up(5)                            # hold for 5 trades
+        for i in range(5):
+            d = lad.get_stake(5.0)
+            assert d.multiplier == 1.0, f"trade {i} should still be capped"
+            lad.on_trade_result(True, 2.0)             # win or loss both count
+            clk.advance(60)
+        # After the 5th settled trade the hold clears → size-up resumes.
+        assert lad.get_stake(5.0).multiplier > 1.0
+
+    def test_pause_size_up_counts_losses_too(self):
+        clk = FakeClock()
+        # cooldown_cycles=0 isolates the pause from the normal post-loss
+        # anti-chase cooldown, so we test only that losses tick the hold down.
+        lad = make_ladder(clock=clk, min_trades=5, window=20, cooldown_secs=0,
+                          cooldown_cycles=0)
+        for _ in range(9):
+            lad.on_trade_result(True, 2.0)
+            clk.advance(60)
+        lad.pause_size_up(3)
+        for _ in range(3):
+            assert lad.get_stake(5.0).multiplier == 1.0
+            lad.on_trade_result(False, -1.0)          # losses tick the hold down
+            clk.advance(60)
+        # Hold satisfied by 3 settled trades regardless of outcome. (Win rate is
+        # still 9/12=75% and loss streak 3<4, so the tier size-up returns.)
+        assert lad.get_stake(5.0).multiplier > 1.0
+
+    def test_pause_size_up_zero_is_noop(self):
+        lad = make_ladder(min_trades=5, window=20, cooldown_secs=0)
+        before = lad.cooldown_cycle
+        lad.pause_size_up(0)
+        assert lad.cooldown_cycle == before
+
     def test_drawdown_override_in_get_stake(self):
         clk = FakeClock()
         lad = make_ladder(clock=clk, min_trades=5, max_daily_loss=10.0,

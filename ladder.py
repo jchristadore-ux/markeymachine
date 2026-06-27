@@ -392,8 +392,12 @@ class StakeLadder:
             # Cooling: after a loss, hold at baseline for a time delay AND at
             # least `cooldown_cycles` trade cycles (whichever is longer). This
             # also blocks an immediate size-up on the first post-loss win.
-            self.cooldown_until = self._clock() + self.cfg.cooldown_secs
-            self.cooldown_cycle = self.tracker.cycles + self.cfg.cooldown_cycles
+            self.cooldown_until = max(self.cooldown_until,
+                                      self._clock() + self.cfg.cooldown_secs)
+            # max() so a short anti-chase cooldown never shortens a longer hold
+            # already pending (e.g. one set by pause_size_up on recovery exit).
+            self.cooldown_cycle = max(self.cooldown_cycle,
+                                      self.tracker.cycles + self.cfg.cooldown_cycles)
 
         log.info(
             "LADDER │ recorded %s pnl=$%.2f │ WR=%.1f%% n=%d streak=%d",
@@ -405,6 +409,27 @@ class StakeLadder:
 
     # Alias required by the integration spec.
     update_performance = on_trade_result
+
+    # ── public hook: externally-triggered baseline hold ─────────────────────
+    def pause_size_up(self, cycles: int) -> None:
+        """Suppress win-rate size-up for the next `cycles` settled trades (win or
+        loss), holding the multiplier at baseline (1x) no matter how strong the
+        rolling win rate is. Downside protections (loss-streak demote, drawdown,
+        vol cap) stay active throughout — this only blocks scaling *above* base.
+
+        Reuses the anti-chase cooldown's cycle counter, so a normal post-loss
+        cooldown and this hold compose naturally (whichever lasts longer wins).
+        Intended for recovery-mode exit: after sizing returns to NORMAL, the
+        ladder must re-prove the edge on fresh trades before scaling up again.
+        No-op for cycles <= 0."""
+        if cycles <= 0:
+            return
+        self.cooldown_cycle = max(self.cooldown_cycle,
+                                  self.tracker.cycles + int(cycles))
+        log.info("LADDER │ size-up paused for %d trades (until cycle %d).",
+                 cycles, self.cooldown_cycle)
+        if self.cfg.persist:
+            self._save()
 
     # ── optional external signals ───────────────────────────────────────────
     def set_vol_spike(self, active: bool) -> None:

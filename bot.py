@@ -361,6 +361,14 @@ RECOVERY_PERSIST    = _env_bool("RECOVERY_PERSIST", True)
 # LADDER_ENABLED=true. See ladder.py and LADDER_STRATEGY.md.
 LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 
+# After a recovery-mode exit (sizing returns to NORMAL_TRADE_SIZE), suppress the
+# ladder's win-rate size-up for this many settled trades — win or loss — so the
+# ladder re-proves the edge on fresh data before it can scale the stake above
+# NORMAL_TRADE_SIZE again. Downside guardrails (loss-streak demote, drawdown)
+# stay active throughout. Set 0 to disable the pause. No effect unless the ladder
+# is enabled.
+RECOVERY_LADDER_PAUSE_TRADES = _env_int("RECOVERY_LADDER_PAUSE_TRADES", 5)
+
 # ── Risk controls ─────────────────────────────────────────────────────────────
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
 MAX_DAILY_LOSS        = _env_float("MAX_DAILY_LOSS_DOLLARS", 15.0)
@@ -681,10 +689,16 @@ class RecoveryState:
         log.warning("Recovery target reached.")
         log.warning("Recovery mode DEACTIVATED.")
         log.warning("Switching trade size back to: $%.2f", NORMAL_TRADE_SIZE)
-        tg.send_telegram_message(
-            f"✅ RECOVERY COMPLETE — balance ${current_balance:.2f} ≥ target "
-            f"${reached:.2f}\nTrade size → ${NORMAL_TRADE_SIZE:.2f}"
-        )
+        msg = (f"✅ RECOVERY COMPLETE — balance ${current_balance:.2f} ≥ target "
+               f"${reached:.2f}\nTrade size → ${NORMAL_TRADE_SIZE:.2f}")
+        # Make the ladder re-prove the edge on fresh data: hold its win-rate
+        # size-up at baseline for the next RECOVERY_LADDER_PAUSE_TRADES trades
+        # before it can scale the stake above NORMAL_TRADE_SIZE again.
+        if stake_ladder is not None and RECOVERY_LADDER_PAUSE_TRADES > 0:
+            stake_ladder.pause_size_up(RECOVERY_LADDER_PAUSE_TRADES)
+            msg += (f"\nLadder size-up paused for "
+                    f"{RECOVERY_LADDER_PAUSE_TRADES} trades.")
+        tg.send_telegram_message(msg)
         return True
 
     def reconcile_on_boot(self, current_balance: float) -> None:
