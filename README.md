@@ -150,6 +150,7 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `RECOVERY_TRADE_SIZE` | `100` | Reduced stake used while recovering a full-size loss (v9.5.0) |
 | `RECOVERY_STATE_PATH` | `recovery_state.json` | Where recovery state is persisted. Point at a mounted Railway **Volume** (e.g. `/data/recovery_state.json`) to survive redeploys |
 | `RECOVERY_PERSIST` | `true` | Set `false` to disable recovery-state persistence |
+| `RECOVERY_LADDER_PAUSE_TRADES` | `5` | After recovery exits and sizing returns to `NORMAL_TRADE_SIZE`, hold the ladder's win-rate size-up at baseline for this many fresh trades (win or loss) before it can scale above normal again. `0` disables. No effect unless `LADDER_ENABLED=true` |
 | `TRADE_SIZE_DOLLARS` | `500` | Legacy flat stake; now the default for `NORMAL_TRADE_SIZE` |
 | `MAX_BET_FRACTION` | `1.0` | **Dead config (v9.4.1)** — flat sizing ignores it |
 | `SESSION_STOP_FRACTION` | `0.40` | Catastrophic backstop — halt below this fraction of session-start balance |

@@ -1234,3 +1234,26 @@ class TestOnTradeSettledRecoveryEntry:
         # 3) balance reaches target → auto-resume normal
         assert bot.recovery.maybe_exit(10_000.0) is True
         assert bot.recovery.active is False
+
+    def test_recovery_exit_pauses_ladder_size_up(self, monkeypatch):
+        """Exiting recovery holds the ladder at baseline for N fresh trades so
+        it re-proves the edge before scaling the stake above NORMAL again."""
+        from ladder import StakeLadder, LadderConfig
+        self._no_telegram(monkeypatch)
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=5,
+                                           window=20, cooldown_secs=0))
+        monkeypatch.setattr(bot, "stake_ladder", lad)
+        monkeypatch.setattr(bot, "RECOVERY_LADDER_PAUSE_TRADES", 5)
+        # Hot record → the ladder would size up if not paused.
+        for _ in range(9):
+            lad.on_trade_result(True, 2.0)
+        assert lad.get_stake(5.0).multiplier > 1.0
+
+        # Arm recovery, then exit at target → pause must engage.
+        bot.recovery.active = True
+        bot.recovery.target_balance = 10_000.0
+        assert bot.recovery.maybe_exit(10_000.0) is True
+        for _ in range(5):
+            assert lad.get_stake(5.0).multiplier == 1.0   # held at baseline
+            lad.on_trade_result(True, 2.0)
+        assert lad.get_stake(5.0).multiplier > 1.0        # resumes after 5
