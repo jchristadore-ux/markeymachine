@@ -953,6 +953,146 @@ class TestUpdateLivePrior:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TIME-OF-DAY LEARNED PRIOR  (per-bucket Bayesian calibration — afternoon fix)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestBucketStats:
+    """The persistent per-time-of-day prior that learns the afternoon is worse.
+    Exercised in isolation from the module singleton (persist=False / tmp_path)."""
+
+    def _bs(self, persist=False, path="unused.json"):
+        return bot.BucketStats(path=path, persist=persist)
+
+    # ── bucketing ──────────────────────────────────────────────────────────────
+    def test_key_groups_hours(self, monkeypatch):
+        monkeypatch.setattr(bot, "BUCKET_GROUP_HOURS", 3)
+        # 18:00–20:59 UTC (the mean-reverting US afternoon) share one bucket.
+        assert bot.BucketStats.key_for_hour(18) == "18-20"
+        assert bot.BucketStats.key_for_hour(19) == "18-20"
+        assert bot.BucketStats.key_for_hour(20) == "18-20"
+        assert bot.BucketStats.key_for_hour(21) == "21-23"
+        assert bot.BucketStats.key_for_hour(0)  == "00-02"
+
+    # ── prior_for blend ──────────────────────────────────────────────────────────
+    def test_empty_bucket_is_base_accuracy(self, monkeypatch):
+        monkeypatch.setattr(bot, "OB_BASE_ACCURACY", 0.635)
+        prior, n = self._bs().prior_for("18-20")
+        assert prior == 0.635 and n == 0
+
+    def test_thin_sample_shrinks_toward_base(self, monkeypatch):
+        monkeypatch.setattr(bot, "OB_BASE_ACCURACY", 0.635)
+        monkeypatch.setattr(bot, "BUCKET_PRIOR_FULL_N", 30)
+        bs = self._bs()
+        bs.record("18-20", won=False)   # 0W/1L, weight = 1/30 → barely moves
+        prior, n = bs.prior_for("18-20")
+        assert n == 1 and prior < 0.635 and prior > 0.60
+
+    def test_large_losing_sample_drops_prior(self, monkeypatch):
+        monkeypatch.setattr(bot, "OB_BASE_ACCURACY", 0.635)
+        monkeypatch.setattr(bot, "BUCKET_PRIOR_FULL_N", 30)
+        bs = self._bs()
+        for _ in range(10):
+            bs.record("18-20", won=True)
+        for _ in range(40):
+            bs.record("18-20", won=False)
+        prior, n = bs.prior_for("18-20")
+        # n=50 ≥ full_N → weight 1.0 → prior == empirical 10/50 = 0.20.
+        assert n == 50 and abs(prior - 0.20) < 1e-9
+
+    def test_large_winning_sample_lifts_prior(self, monkeypatch):
+        monkeypatch.setattr(bot, "OB_BASE_ACCURACY", 0.635)
+        monkeypatch.setattr(bot, "BUCKET_PRIOR_FULL_N", 30)
+        bs = self._bs()
+        for _ in range(40):
+            bs.record("14-16", won=True)
+        for _ in range(10):
+            bs.record("14-16", won=False)
+        prior, _ = bs.prior_for("14-16")
+        assert prior > 0.635
+
+    def test_record_ignores_missing_key(self):
+        bs = self._bs()
+        bs.record(None, won=False)   # unmatched pre-restart trade → no-op
+        bs.record("", won=True)
+        assert bs.prior_for(None) == (bot.OB_BASE_ACCURACY, 0)
+
+    # ── persistence ──────────────────────────────────────────────────────────────
+    def test_save_load_round_trip(self, tmp_path):
+        p = str(tmp_path / "bucket_stats.json")
+        bs = bot.BucketStats(path=p, persist=True)
+        bs.record("18-20", won=False)
+        bs.record("18-20", won=False)
+        bs.record("18-20", won=True)
+        # A fresh instance must read the accumulated tally back from disk — this
+        # is what lets the afternoon bleed accumulate across daily restarts.
+        reloaded = bot.BucketStats(path=p, persist=True)
+        _, n = reloaded.prior_for("18-20")
+        assert n == 3
+
+    def test_missing_file_self_heals(self, tmp_path):
+        p = str(tmp_path / "does_not_exist.json")
+        bs = bot.BucketStats(path=p, persist=True)   # no crash on absent file
+        assert bs.prior_for("18-20") == (bot.OB_BASE_ACCURACY, 0)
+
+    def test_corrupt_file_self_heals(self, tmp_path):
+        p = tmp_path / "bucket_stats.json"
+        p.write_text("{not valid json")
+        bs = bot.BucketStats(path=str(p), persist=True)   # no crash on garbage
+        assert bs.prior_for("18-20") == (bot.OB_BASE_ACCURACY, 0)
+
+
+class TestBucketPriorGatesAfternoon:
+    """The learned afternoon prior must flow through win_prob into the edge gate
+    so a poor-performing bucket stops trading — the actual mitigation."""
+
+    def _ob(self):
+        return {"imbalance": 0.71, "total_depth": 34000.0, "eff_thresh": 0.66}
+
+    def _losing_now(self, monkeypatch):
+        bs  = bot.BucketStats(path="unused.json", persist=False)
+        key = bs.key_now()                       # whatever bucket "now" falls in
+        for _ in range(10):
+            bs.record(key, won=True)
+        for _ in range(40):
+            bs.record(key, won=False)            # 10W/40L → prior 0.20
+        monkeypatch.setattr(bot, "bucket_stats", bs)
+
+    def _empty_now(self, monkeypatch):
+        monkeypatch.setattr(
+            bot, "bucket_stats",
+            bot.BucketStats(path="unused.json", persist=False))
+
+    def test_losing_bucket_lowers_win_prob(self, monkeypatch):
+        monkeypatch.setattr(bot, "OB_BASE_ACCURACY", 0.635)
+        monkeypatch.setattr(bot, "BUCKET_PRIOR_FULL_N", 30)
+        args = (self._ob(), "AGREE", 0.045, bot.Regime.TRENDING_UP, 0.78, 0.0)
+
+        self._empty_now(monkeypatch)
+        wp_empty = bot.bayesian_win_prob(*args)
+        self._losing_now(monkeypatch)
+        wp_losing = bot.bayesian_win_prob(*args)
+
+        assert wp_losing < wp_empty
+
+    def test_losing_bucket_flips_edge_gate(self, monkeypatch):
+        monkeypatch.setattr(bot, "OB_BASE_ACCURACY", 0.635)
+        monkeypatch.setattr(bot, "BUCKET_PRIOR_FULL_N", 30)
+        monkeypatch.setattr(bot, "MIN_EDGE_PCT", 0.06)
+        args  = (self._ob(), "AGREE", 0.045, bot.Regime.TRENDING_UP, 0.78, 0.0)
+        price = 59   # the cent price of the 2026-06-29 14:00-ET losing trade
+
+        self._empty_now(monkeypatch)
+        edge_empty = bot.calc_edge(bot.bayesian_win_prob(*args), price)
+        self._losing_now(monkeypatch)
+        edge_losing = bot.calc_edge(bot.bayesian_win_prob(*args), price)
+
+        # Same setup: a fresh bucket clears the edge gate and trades; a bucket
+        # with a proven losing record falls below it and skips.
+        assert edge_empty >= bot.MIN_EDGE_PCT
+        assert edge_losing < bot.MIN_EDGE_PCT
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PEM NORMALIZATION
 # ═════════════════════════════════════════════════════════════════════════════
 

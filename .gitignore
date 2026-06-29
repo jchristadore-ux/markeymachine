@@ -28,6 +28,8 @@ recovery_state.json
 recovery_state.json.tmp
 probation_state.json
 probation_state.json.tmp
+bucket_stats.json
+bucket_stats.json.tmp
 
 # OS
 .DS_Store
