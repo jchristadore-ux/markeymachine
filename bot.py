@@ -1,7 +1,30 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.5.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.6.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.6.0 — PROBATION RAMP: graduated re-entry after recovery (log-review fix).║
+║                                                                              ║
+║  2026-06-29 logs: the book grinds back up $100 at a time but loses $500 at a ║
+║  time — one full-size loss wiped ~5 small wins and re-armed recovery. Two    ║
+║  defects vs. intent ("stay small until the edge re-proves"):                 ║
+║    1. Recovery EXIT snapped the base straight $100 → $500 on the next trade. ║
+║       RECOVERY_LADDER_PAUSE_TRADES only held the ladder *multiplier* at 1×,  ║
+║       never the base, so the stake was never kept small.                     ║
+║    2. The ladder LEAKED through recovery: a $100 base × 2.0 tier placed a    ║
+║       $200 trade while "in recovery."                                        ║
+║                                                                              ║
+║  FIX: on recovery exit the bot no longer jumps to full size — it climbs a    ║
+║  ProbationState ramp of sub-full base sizes (default $100 → $250 → $500),    ║
+║  advancing ONE rung on a short win streak OR a rolling win-rate threshold    ║
+║  (whichever fires first) and stepping ONE rung down on any loss. Reaching    ║
+║  full size graduates back to normal. Throughout recovery AND the ramp the    ║
+║  laddering overlay is capped at the active base (it may size DOWN, never UP) ║
+║  — closing the $200 leak. State persists to PROBATION_STATE_PATH and         ║
+║  reconciles on boot. RAILWAY: PROBATION_RAMP_ENABLED (default true),         ║
+║  PROBATION_WIN_STREAK (2), PROBATION_WIN_RATE_MIN (0.60), PROBATION_RUNGS    ║
+║  (explicit override, e.g. "100,250"). Set PROBATION_RAMP_ENABLED=false to    ║
+║  restore the old immediate snap-back to full size.                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.5.0 — RECOVERY MODE: two-tier position sizing (owner directive).         ║
 ║                                                                              ║
@@ -238,7 +261,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.5.0"
+BOT_VERSION = "9.6.0"
 
 import base64
 import json
@@ -368,6 +391,59 @@ LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 # stay active throughout. Set 0 to disable the pause. No effect unless the ladder
 # is enabled.
 RECOVERY_LADDER_PAUSE_TRADES = _env_int("RECOVERY_LADDER_PAUSE_TRADES", 5)
+
+# ── Post-recovery graduated re-entry ("probation ramp") ───────────────────────
+# WHY (2026-06-29 log review): the book grinds back up $100 at a time but loses
+# $500 at a time. After recovery cleared, the OLD behavior snapped the base
+# straight from RECOVERY_TRADE_SIZE back to the full NORMAL_TRADE_SIZE on the very
+# next trade; a single full-size loss then wiped ~5 small wins and re-armed
+# recovery. RECOVERY_LADDER_PAUSE_TRADES only held the ladder *multiplier* at 1×,
+# not the base, so it never kept the stake small.
+#
+# Instead, when recovery clears we do NOT jump back to full size. We re-enter at
+# the recovery base and climb a ladder of sub-full base sizes, advancing exactly
+# one rung when the edge re-proves itself (a short win streak OR a rolling
+# win-rate threshold — whichever fires first) and stepping one rung DOWN on any
+# loss. Reaching full size graduates back to normal mode. Throughout the ramp the
+# laddering overlay is capped at the current base (it may size DOWN but never UP),
+# so a win rate earned at small size can never re-arm full stake in one jump.
+PROBATION_RAMP_ENABLED       = _env_bool("PROBATION_RAMP_ENABLED", True)
+# Advance one rung after this many consecutive wins at the current base size.
+PROBATION_WIN_STREAK         = _env_int("PROBATION_WIN_STREAK", 2)
+# ...OR advance when the rolling win rate over the probation clears this, once at
+# least PROBATION_WINRATE_MIN_TRADES have settled in the ramp. "Either" wins.
+PROBATION_WIN_RATE_MIN       = _env_float("PROBATION_WIN_RATE_MIN", 0.60)
+PROBATION_WINRATE_MIN_TRADES = _env_int("PROBATION_WINRATE_MIN_TRADES", 4)
+# Explicit override for the ramp's sub-full base sizes, comma-separated dollars
+# (e.g. "100,250"). Empty → auto-build [RECOVERY_TRADE_SIZE, NORMAL_TRADE_SIZE/2].
+# Values are clamped to the [RECOVERY_TRADE_SIZE, NORMAL_TRADE_SIZE) half-open
+# range; NORMAL_TRADE_SIZE itself is the graduation target, never a rung.
+PROBATION_RUNGS_RAW          = os.environ.get("PROBATION_RUNGS", "").strip()
+PROBATION_STATE_PATH         = os.environ.get("PROBATION_STATE_PATH", "probation_state.json")
+PROBATION_PERSIST            = _env_bool("PROBATION_PERSIST", True)
+
+
+def _probation_rungs() -> "list[float]":
+    """Ascending list of sub-full base sizes the ramp climbs through. Each is in
+    [RECOVERY_TRADE_SIZE, NORMAL_TRADE_SIZE); full size is the graduation target,
+    not a rung. Returns [] when there is no room to ramp (caller stays normal)."""
+    lo, hi = RECOVERY_TRADE_SIZE, NORMAL_TRADE_SIZE
+    if hi <= lo:
+        return []
+    if PROBATION_RUNGS_RAW:
+        try:
+            vals = sorted({round(float(x), 2) for x in PROBATION_RUNGS_RAW.split(",") if x.strip()})
+        except ValueError:
+            vals = []
+        rungs = [v for v in vals if lo <= v < hi]
+        if not rungs or rungs[0] > lo:
+            rungs = [lo] + [r for r in rungs if r > lo]
+        return rungs
+    rungs = [lo]
+    mid = round(hi / 2.0, 2)
+    if lo < mid < hi:
+        rungs.append(mid)
+    return rungs
 
 # ── Risk controls ─────────────────────────────────────────────────────────────
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
@@ -755,21 +831,238 @@ class RecoveryState:
 recovery = RecoveryState(RECOVERY_STATE_PATH, RECOVERY_PERSIST)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PROBATION RAMP  (post-recovery graduated re-entry — log-review fix)
+#
+# Mutated IN-PLACE only, never reassigned (same rule as `recovery`). Coupled to
+# recovery: it STARTS when recovery clears and is mutually exclusive with it
+# (recovery only re-arms on a true full-size loss, which can only happen after
+# the ramp has graduated back to normal). See the config block above for the why.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProbationState:
+    """Persistent graduated re-entry after a recovery exit. Owns the ramp of
+    sub-full base sizes and advances/steps based on settled outcomes."""
+
+    SCHEMA = 1
+
+    def __init__(self, path: str, persist: bool) -> None:
+        self.active:    bool        = False
+        self.rungs:     List[float] = []     # ascending sub-full base sizes
+        self.level:     int         = 0      # index into rungs
+        self.full_size: float       = 0.0    # graduation target (NORMAL size)
+        self.streak:    int         = 0      # consecutive wins at the current rung
+        self.wins:      int         = 0      # cumulative settled wins this ramp
+        self.losses:    int         = 0      # cumulative settled losses this ramp
+        self._path    = path
+        self._persist = persist
+        if self._persist:
+            self._load()
+
+    # ── transitions ──────────────────────────────────────────────────────────
+    def start(self, rungs: List[float], full_size: float) -> bool:
+        """Begin a ramp from rungs[0] up toward full_size. No-op (returns False)
+        when the ramp is disabled or there is no sub-full room to climb — the
+        caller then resumes full size directly, exactly as before."""
+        if not PROBATION_RAMP_ENABLED:
+            return False
+        rungs = [round(float(r), 2) for r in rungs if r < full_size]
+        if not rungs:
+            return False
+        self.active    = True
+        self.rungs     = rungs
+        self.level     = 0
+        self.full_size = round(float(full_size), 2)
+        self.streak    = 0
+        self.wins      = 0
+        self.losses    = 0
+        self._save()
+        log.warning("Probation ramp START │ base $%.2f → full $%.2f via %s",
+                    self.rungs[0], self.full_size,
+                    " → ".join(f"${r:.0f}" for r in self.rungs + [self.full_size]))
+        tg.send_telegram_message(
+            f"🪜 PROBATION RAMP STARTED\n"
+            f"Re-entering at ${self.rungs[0]:.2f}; will climb "
+            f"{' → '.join(f'${r:.0f}' for r in self.rungs + [self.full_size])} "
+            f"as the edge re-proves itself.\n"
+            f"Advance on {PROBATION_WIN_STREAK}-win streak or "
+            f"≥{PROBATION_WIN_RATE_MIN*100:.0f}% win rate; step down on a loss."
+        )
+        return True
+
+    def current_size(self) -> float:
+        """The base stake for the current rung (full_size when inactive)."""
+        if not self.active or not self.rungs:
+            return self.full_size or NORMAL_TRADE_SIZE
+        return self.rungs[min(self.level, len(self.rungs) - 1)]
+
+    def _gate_met(self) -> bool:
+        if self.streak >= PROBATION_WIN_STREAK:
+            return True
+        n = self.wins + self.losses
+        return (n >= PROBATION_WINRATE_MIN_TRADES
+                and (self.wins / n) >= PROBATION_WIN_RATE_MIN)
+
+    def record_result(self, won: bool) -> None:
+        """Fold one settled probation-mode trade into the ramp."""
+        if not self.active:
+            return
+        if won:
+            self.wins  += 1
+            self.streak += 1
+            if self._gate_met():
+                self._advance()
+        else:
+            self.losses += 1
+            self.streak  = 0
+            self._step_down()
+        if self.active:                 # _advance may have graduated (saved already)
+            self._save()
+
+    def _advance(self) -> None:
+        if self.level >= len(self.rungs) - 1:
+            self._graduate()
+            return
+        self.level += 1
+        self.streak = 0                 # must re-prove the edge at the larger size
+        log.warning("Probation ramp UP → base $%.2f (rung %d/%d).",
+                    self.current_size(), self.level + 1, len(self.rungs))
+        tg.send_telegram_message(
+            f"🪜 PROBATION RAMP UP → ${self.current_size():.2f} "
+            f"(rung {self.level + 1}/{len(self.rungs)})"
+        )
+
+    def _step_down(self) -> None:
+        if self.level == 0:
+            log.info("Probation ramp │ loss at floor ${:.2f} — holding."
+                     .format(self.current_size()))
+            return
+        self.level -= 1
+        log.warning("Probation ramp DOWN → base $%.2f (loss).", self.current_size())
+        tg.send_telegram_message(
+            f"🪜 PROBATION RAMP DOWN → ${self.current_size():.2f} (loss)"
+        )
+
+    def _graduate(self) -> None:
+        size = self.full_size or NORMAL_TRADE_SIZE
+        self.active = False
+        self.level  = 0
+        self.rungs  = []
+        self._save()
+        log.warning("Probation ramp COMPLETE → full size $%.2f restored.", size)
+        # Fresh ladder cooldown at full size so the overlay cannot 2× immediately
+        # on a win rate banked at smaller stakes.
+        if stake_ladder is not None and RECOVERY_LADDER_PAUSE_TRADES > 0:
+            stake_ladder.pause_size_up(RECOVERY_LADDER_PAUSE_TRADES)
+        tg.send_telegram_message(
+            f"✅ PROBATION COMPLETE — full size ${size:.2f} restored."
+        )
+
+    def cancel(self) -> None:
+        """Drop the ramp (e.g. a deeper full-size loss re-arms recovery)."""
+        if not self.active:
+            return
+        self.active = False
+        self.level  = 0
+        self.rungs  = []
+        self.streak = self.wins = self.losses = 0
+        self._save()
+
+    def reconcile_on_boot(self) -> None:
+        if not self.active:
+            return
+        if not self.rungs or self.full_size <= 0.0:
+            log.warning("Probation boot │ corrupt ramp — clearing.")
+            self.cancel()
+            return
+        self.level = max(0, min(self.level, len(self.rungs) - 1))
+        log.info("Probation boot │ RESUMING ramp at base $%.2f (rung %d/%d).",
+                 self.current_size(), self.level + 1, len(self.rungs))
+
+    def status_line(self) -> str:
+        n  = self.wins + self.losses
+        wr = (self.wins / n * 100.0) if n else 0.0
+        return (f"Probation ramp active. Base ${self.current_size():.2f} "
+                f"(rung {self.level + 1}/{len(self.rungs)}, target ${self.full_size:.2f}). "
+                f"streak={self.streak} WR={wr:.0f}% n={n}.")
+
+    # ── persistence (atomic JSON write) ────────────────────────────────────────
+    def _save(self) -> None:
+        if not self._persist:
+            return
+        try:
+            tmp = f"{self._path}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "schema":    self.SCHEMA,
+                    "active":    self.active,
+                    "rungs":     self.rungs,
+                    "level":     self.level,
+                    "full_size": self.full_size,
+                    "streak":    self.streak,
+                    "wins":      self.wins,
+                    "losses":    self.losses,
+                }, f)
+            os.replace(tmp, self._path)   # atomic on POSIX
+        except OSError as e:
+            log.warning("Probation │ state save failed: %s", e)
+
+    def _load(self) -> None:
+        try:
+            with open(self._path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return
+        self.active    = bool(d.get("active", False))
+        self.rungs     = [round(float(r), 2) for r in d.get("rungs", [])]
+        self.level     = int(d.get("level", 0))
+        self.full_size = float(d.get("full_size", 0.0) or 0.0)
+        self.streak    = int(d.get("streak", 0))
+        self.wins      = int(d.get("wins", 0))
+        self.losses    = int(d.get("losses", 0))
+
+
+probation = ProbationState(PROBATION_STATE_PATH, PROBATION_PERSIST)
+
+
 def active_trade_size() -> float:
     """The dollar stake for the current mode. Single source of truth for sizing
-    — every position-sizing path derives from this, not from a raw env var."""
-    return RECOVERY_TRADE_SIZE if recovery.active else NORMAL_TRADE_SIZE
+    — every position-sizing path derives from this, not from a raw env var.
+    Priority: recovery (deepest claw-back) → probation ramp → normal."""
+    if recovery.active:
+        return RECOVERY_TRADE_SIZE
+    if probation.active:
+        return probation.current_size()
+    return NORMAL_TRADE_SIZE
+
+
+def in_clawback() -> bool:
+    """True while clawing back a loss (recovery OR probation ramp). In this state
+    the laddering overlay is capped at the active base — it may size DOWN but
+    never UP — so a win rate earned at small stakes cannot re-arm full size."""
+    return recovery.active or probation.active
 
 
 def on_trade_settled(won: bool, trade_rec: dict, current_balance: float) -> None:
     """Recovery ENTRY hook, called once per settled trade. Activates recovery
     only when a normal-mode (full-size) trade loses and we are not already in
-    recovery; the target is the balance recorded just before that trade."""
+    recovery; the target is the balance recorded just before that trade. A
+    full-size loss also cancels any in-flight probation ramp (we are dropping
+    back into the deeper recovery tier)."""
     if won or recovery.active:
         return
     if (trade_rec or {}).get("mode_at_entry") != "normal":
-        return  # recovery-mode losses and un-attributable trades never trigger
-    recovery.enter((trade_rec or {}).get("balance_before"), current_balance)
+        return  # recovery/probation-mode losses and un-attributable trades skip
+    if recovery.enter((trade_rec or {}).get("balance_before"), current_balance):
+        probation.cancel()
+
+
+def probation_record(won: bool, trade_rec: dict) -> None:
+    """Probation RAMP hook, called once per settled trade. Only probation-mode
+    trades (entered while the ramp was active) advance or step the ramp."""
+    if (trade_rec or {}).get("mode_at_entry") != "probation":
+        return
+    probation.record_result(bool(won))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1247,8 +1540,14 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
 
     # Laddering overlay (opt-in). Scales the flat stake by a performance
     # multiplier, but never past 2× the active trade size or the cash on hand.
+    # While clawing back a loss (recovery OR the post-recovery probation ramp)
+    # the ceiling is the active base itself: the ladder may size DOWN on a cold
+    # streak but can NEVER size UP, so a win rate banked at small stakes can't
+    # re-arm full size in one jump (the 2026-06-29 "$100 base × 2.0 = $200 in
+    # recovery" leak).
     if stake_ladder is not None:
-        ceiling  = min(stake_ladder.cfg.max_multiplier * size, balance)
+        cap_mult = 1.0 if in_clawback() else stake_ladder.cfg.max_multiplier
+        ceiling  = min(cap_mult * size, balance)
         decision = stake_ladder.get_stake(base_bet, max_stake=ceiling)
         return decision.stake
 
@@ -1564,6 +1863,8 @@ def resolve_open_orders() -> None:
             # trade's recorded pre-trade balance as the target). paper_balance is
             # already updated above for this settlement.
             on_trade_settled(won, trade, paper_balance)
+            # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
+            probation_record(won, trade)
 
             log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
                      ticker[-15:], side, result.upper(), sim, paper_balance)
@@ -1687,6 +1988,8 @@ def resolve_open_orders() -> None:
             # Recovery ENTRY hook: `balance` was fetched (realized) above for
             # this settled trade.
             on_trade_settled(won, trade, balance)
+            # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
+            probation_record(won, trade)
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",
@@ -1905,7 +2208,9 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
     # v9.5.0: stamp the sizing mode + the realized balance immediately BEFORE
     # this trade so settlement can (a) tell a full-size loss from a recovery-size
     # loss and (b) set the recovery target to the exact pre-trade balance.
-    entry_mode = "recovery" if recovery.active else "normal"
+    entry_mode = ("recovery" if recovery.active
+                  else "probation" if probation.active
+                  else "normal")
 
     if DEMO_MODE:
         paper_balance -= cost
@@ -2307,7 +2612,10 @@ def main() -> None:
     log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
              NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
              " (RECOVERY active, target $%.2f)" % recovery.target_balance
-             if recovery.active else "")
+             if recovery.active else
+             " (PROBATION ramp, rung $%.0f→full $%.0f)"
+             % (probation.current_size(), NORMAL_TRADE_SIZE)
+             if probation.active else "")
     log.info("  Kelly=%.2f | SessionScore≥%d", KELLY_FRACTION, MIN_SESSION_SCORE)
     log.info("━" * 70)
 
@@ -2322,6 +2630,7 @@ def main() -> None:
         session_start_balance  = paper_balance
         session_stop_threshold = paper_balance * SESSION_STOP_FRACTION
         recovery.reconcile_on_boot(paper_balance)
+        probation.reconcile_on_boot()
         telegram_boot(paper_balance)
     else:
         try:
@@ -2343,6 +2652,7 @@ def main() -> None:
         running_pnl        = 0.0
         live_daily_realized = 0.0
         recovery.reconcile_on_boot(bal)
+        probation.reconcile_on_boot()
         telegram_boot(bal)
 
     resolve_cycle = 0
@@ -2393,7 +2703,11 @@ def main() -> None:
             update_session_state(current_balance)
             # Recovery EXIT check runs every cycle, independent of trading, so
             # the bot can never wedge in recovery once balance reaches target.
-            recovery.maybe_exit(current_balance)
+            # On a real exit, begin the graduated probation ramp instead of
+            # snapping straight back to full size (no-op if the ramp is disabled
+            # or there is no sub-full room, in which case sizing resumes normal).
+            if recovery.maybe_exit(current_balance):
+                probation.start(_probation_rungs(), NORMAL_TRADE_SIZE)
             run_decision(market, current_balance)
 
             resolve_cycle += 1
@@ -2435,6 +2749,8 @@ def main() -> None:
 
                 if recovery.active:
                     log.info(recovery.status_line(current_balance))
+                elif probation.active:
+                    log.info(probation.status_line())
 
             time.sleep(POLL_INTERVAL)
 

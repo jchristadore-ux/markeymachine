@@ -26,6 +26,8 @@ build/
 ladder_state.json
 recovery_state.json
 recovery_state.json.tmp
+probation_state.json
+probation_state.json.tmp
 
 # OS
 .DS_Store
