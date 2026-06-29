@@ -514,6 +514,32 @@ SESSION_QUALITY: dict = {
 }
 MIN_SESSION_SCORE = _env_int("MIN_SESSION_SCORE", 60)
 
+# ── Time-of-day learned prior (per-bucket Bayesian calibration) ───────────────
+# WHY (2026-06-29 log review + 4-day pattern): the bot runs ONE strategy —
+# short-dated trend-continuation — and trend persistence is time-of-day
+# dependent. The US morning→midday trends; the US afternoon (ET ~2–4pm /
+# UTC ~18–21) is the post-lunch lull that mean-reverts, so the exact setups that
+# win in the morning bleed in the afternoon. The win-prob prior was a single
+# pooled number (`_live_prior`) that ALSO resets to OB_BASE_ACCURACY every boot
+# (live_wins/live_losses are in-memory), so the book never "noticed" the
+# repeating afternoon losses.
+#
+# Fix: learn a SEPARATE prior per time-of-day bucket, PERSISTED to disk so it
+# accumulates across days/restarts (the morning bleed is a multi-day signal).
+# A bucket with a poor realized win rate lowers win_prob → lowers edge → trips
+# the existing MIN_EDGE_PCT / Kelly gates, so weak afternoon setups simply do
+# not fire. Stake is untouched (gate, never sandbag size — owner directive).
+# With no data the bucket prior == OB_BASE_ACCURACY, so behaviour is identical
+# to today until real outcomes accumulate (backward-compatible rollout).
+BUCKET_STATS_PATH    = os.environ.get("BUCKET_STATS_PATH", "bucket_stats.json")
+BUCKET_PERSIST       = _env_bool("BUCKET_PERSIST", True)
+# How many UTC hours each bucket spans. 3 → 8 buckets/day, coarse enough that
+# samples accumulate fast enough to matter. Clamped to [1, 24].
+BUCKET_GROUP_HOURS   = max(1, min(24, _env_int("BUCKET_GROUP_HOURS", 3)))
+# Sample size at which a bucket's empirical win rate is fully trusted; below it
+# the prior is shrunk toward OB_BASE_ACCURACY (same blend as update_live_prior).
+BUCKET_PRIOR_FULL_N  = max(1, _env_int("BUCKET_PRIOR_FULL_N", 30))
+
 # ── Bayesian priors ───────────────────────────────────────────────────────────
 OB_BASE_ACCURACY       = _env_float("OB_BASE_ACCURACY", 0.635)
 MOMENTUM_ACCURACY_LIFT = _env_float("MOMENTUM_ACCURACY_LIFT", 0.045)
@@ -1025,6 +1051,97 @@ class ProbationState:
 probation = ProbationState(PROBATION_STATE_PATH, PROBATION_PERSIST)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TIME-OF-DAY LEARNED PRIOR  (per-bucket Bayesian calibration — afternoon fix)
+#
+# Persists realized {wins, losses} per time-of-day bucket so the win-prob prior
+# can learn that some hours (the mean-reverting US afternoon) are worse than
+# others. Keyed by UTC hour — consistent with SESSION_QUALITY — grouped into
+# BUCKET_GROUP_HOURS-wide buckets. Mutated IN-PLACE only, never reassigned (same
+# rule as `recovery`/`probation`). See the config block above for the why.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BucketStats:
+    """Persistent per-time-of-day win/loss tally feeding a learned prior."""
+
+    SCHEMA = 1
+
+    def __init__(self, path: str, persist: bool) -> None:
+        self._data:   dict = {}     # {bucket_key: {"wins": int, "losses": int}}
+        self._path    = path
+        self._persist = persist
+        if self._persist:
+            self._load()
+
+    @staticmethod
+    def key_for_hour(utc_hour: int) -> str:
+        """Human-readable bucket key for a UTC hour, e.g. '18-20' for group=3."""
+        h     = int(utc_hour) % 24
+        start = (h // BUCKET_GROUP_HOURS) * BUCKET_GROUP_HOURS
+        end   = min(start + BUCKET_GROUP_HOURS - 1, 23)
+        return f"{start:02d}-{end:02d}"
+
+    def key_now(self) -> str:
+        return self.key_for_hour(datetime.now(timezone.utc).hour)
+
+    def record(self, bucket_key: Optional[str], won: bool) -> None:
+        """Tally one settled outcome into its ENTRY bucket. No-op on a missing
+        key (e.g. an unmatched pre-restart trade whose entry bucket is unknown)."""
+        if not bucket_key:
+            return
+        s = self._data.setdefault(bucket_key, {"wins": 0, "losses": 0})
+        if won:
+            s["wins"] = int(s.get("wins", 0)) + 1
+        else:
+            s["losses"] = int(s.get("losses", 0)) + 1
+        self._save()
+
+    def prior_for(self, bucket_key: Optional[str]) -> Tuple[float, int]:
+        """Blended prior for a bucket and its sample size. Shrinks toward
+        OB_BASE_ACCURACY when the sample is thin (identical blend to
+        update_live_prior), so an empty/new bucket == today's behaviour."""
+        s     = self._data.get(bucket_key or "", {})
+        wins  = int(s.get("wins", 0))
+        total = wins + int(s.get("losses", 0))
+        if total <= 0:
+            return OB_BASE_ACCURACY, 0
+        empirical = wins / total
+        weight    = min(1.0, total / BUCKET_PRIOR_FULL_N)
+        prior     = OB_BASE_ACCURACY * (1.0 - weight) + empirical * weight
+        return prior, total
+
+    # ── persistence (atomic JSON write) ────────────────────────────────────────
+    def _save(self) -> None:
+        if not self._persist:
+            return
+        try:
+            tmp = f"{self._path}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({"schema": self.SCHEMA, "buckets": self._data}, f)
+            os.replace(tmp, self._path)   # atomic on POSIX
+        except OSError as e:
+            log.warning("BucketStats │ state save failed: %s", e)
+
+    def _load(self) -> None:
+        try:
+            with open(self._path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return
+        raw = d.get("buckets", {})
+        if not isinstance(raw, dict):
+            return
+        clean: dict = {}
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                clean[str(k)] = {"wins":   int(v.get("wins", 0) or 0),
+                                 "losses": int(v.get("losses", 0) or 0)}
+        self._data = clean
+
+
+bucket_stats = BucketStats(BUCKET_STATS_PATH, BUCKET_PERSIST)
+
+
 def active_trade_size() -> float:
     """The dollar stake for the current mode. Single source of truth for sizing
     — every position-sizing path derives from this, not from a raw env var.
@@ -1416,7 +1533,12 @@ def bayesian_win_prob(
     r_squared: float,
     realized_vol: float,
 ) -> float:
-    prior = _live_prior
+    # Time-of-day learned prior: a bucket with a poor realized win rate (the
+    # mean-reverting afternoon) supplies a lower prior, which flows straight
+    # through to a lower edge and gates the trade out. Empty bucket ==
+    # OB_BASE_ACCURACY, so behaviour is unchanged until outcomes accumulate.
+    bucket          = bucket_stats.key_now()
+    prior, bucket_n = bucket_stats.prior_for(bucket)
 
     if regime in (Regime.TRENDING_UP, Regime.TRENDING_DOWN):
         r2_bonus   = (r_squared - R2_TREND_THRESHOLD) * 0.10
@@ -1443,8 +1565,9 @@ def bayesian_win_prob(
         prior + momentum_adj + regime_adj + imbalance_adj + depth_adj - vol_penalty
     ))
 
-    log.info("WinProb │ prior=%.3f mom=%.3f regime=%.3f imb=%.3f depth=%.3f vol=-%.3f → %.3f",
-             prior, momentum_adj, regime_adj, imbalance_adj, depth_adj, vol_penalty, win_prob)
+    log.info("WinProb │ prior=%.3f mom=%.3f regime=%.3f imb=%.3f depth=%.3f vol=-%.3f → %.3f │ bucket=%s n=%d",
+             prior, momentum_adj, regime_adj, imbalance_adj, depth_adj, vol_penalty,
+             win_prob, bucket, bucket_n)
     return win_prob
 
 
@@ -1859,6 +1982,7 @@ def resolve_open_orders() -> None:
                 )
 
             ladder_record(won, trade_pnl)
+            bucket_stats.record(trade.get("entry_bucket"), won)
             # Recovery ENTRY hook: a full-size loss arms recovery (uses this
             # trade's recorded pre-trade balance as the target). paper_balance is
             # already updated above for this settlement.
@@ -1985,6 +2109,7 @@ def resolve_open_orders() -> None:
                     streak_pause_until = time.time() + STREAK_PAUSE_SECS
 
             ladder_record(won, pnl)
+            bucket_stats.record(trade.get("entry_bucket"), won)
             # Recovery ENTRY hook: `balance` was fetched (realized) above for
             # this settled trade.
             on_trade_settled(won, trade, balance)
@@ -2211,6 +2336,10 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
     entry_mode = ("recovery" if recovery.active
                   else "probation" if probation.active
                   else "normal")
+    # Stamp the time-of-day bucket at ENTRY so settlement scores the bucket the
+    # trade was opened in (a 13:46-ET entry into a 14:00 market is afternoon),
+    # not the bucket it happened to settle in.
+    entry_bucket = bucket_stats.key_now()
 
     if DEMO_MODE:
         paper_balance -= cost
@@ -2224,6 +2353,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
             "order_id": client_id, "result": "pending",
             "placed_at": time.time(), "btc_entry_price": btc_entry,
             "mode_at_entry": entry_mode, "balance_before": round(balance_before, 2),
+            "entry_bucket": entry_bucket,
         }
         trade_history.append(rec)
         open_orders[client_id] = rec
@@ -2266,6 +2396,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
             "order_id": order_id, "result": "pending",
             "placed_at": time.time(), "btc_entry_price": btc_entry,
             "mode_at_entry": entry_mode, "balance_before": round(balance_before, 2),
+            "entry_bucket": entry_bucket,
         }
         trade_history.append(rec)
         open_orders[order_id] = rec
@@ -2617,6 +2748,9 @@ def main() -> None:
              % (probation.current_size(), NORMAL_TRADE_SIZE)
              if probation.active else "")
     log.info("  Kelly=%.2f | SessionScore≥%d", KELLY_FRACTION, MIN_SESSION_SCORE)
+    log.info("  TimePrior: %dh buckets fullN=%d | now=%s prior=%.3f n=%d",
+             BUCKET_GROUP_HOURS, BUCKET_PRIOR_FULL_N, bucket_stats.key_now(),
+             *bucket_stats.prior_for(bucket_stats.key_now()))
     log.info("━" * 70)
 
     tg.validate_telegram_connection()
