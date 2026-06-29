@@ -122,6 +122,28 @@ live, and pre-restart branches).
 is byte-for-byte unchanged until you deliberately switch the overlay on. This is
 real money — the new sizing behaviour does not go live on its own.
 
+### Clawback sizing: recovery → probation ramp (v9.6.0)
+
+The base stake the ladder multiplies is *itself* mode-driven (`active_trade_size()`):
+
+1. **Recovery** (`recovery.active`): after a full-size loss, base = `RECOVERY_TRADE_SIZE`
+   until the balance climbs back to the pre-loss target.
+2. **Probation ramp** (`probation.active`): when recovery clears, the base does
+   **not** snap back to full size. It re-enters at the recovery floor and climbs a
+   ladder of sub-full sizes (default `$100 → $250 → $500`), advancing **one rung**
+   on a short win streak *or* a rolling win-rate threshold (whichever fires first)
+   and stepping **one rung down** on any loss. Reaching full size graduates back to
+   normal.
+3. **Normal**: base = `NORMAL_TRADE_SIZE`.
+
+While clawing back (recovery **or** probation), the overlay ceiling is the active
+base itself — the ladder may size **down** on a cold streak but can **never size
+up**. This closes the 2026-06-29 leak where a `$100` recovery base was scaled to
+`$200` by a 2× tier earned at small stakes. The graduation step re-arms the usual
+`RECOVERY_LADDER_PAUSE_TRADES` ladder cooldown so the overlay also can't 2× the
+instant full size returns. The ramp is purely a sizing overlay — trading never
+wedges; the worst case is grinding at the reduced floor.
+
 ---
 
 ## 5. Configuration
@@ -140,6 +162,21 @@ real money — the new sizing behaviour does not go live on its own.
 | `LADDER_COOLDOWN_CYCLES` | `1` | Post-loss cooldown (trade cycles) |
 | `LADDER_STATE_PATH` | `ladder_state.json` | Persistence file |
 | `LADDER_PERSIST` | `true` | Toggle JSON persistence |
+
+### Recovery / probation-ramp sizing (v9.5.0–v9.6.0)
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `NORMAL_TRADE_SIZE` | `TRADE_SIZE_DOLLARS` | Full-size base stake |
+| `RECOVERY_TRADE_SIZE` | `100` | Reduced base while clawing back a full-size loss |
+| `RECOVERY_LADDER_PAUSE_TRADES` | `5` | Hold ladder multiplier at 1× for N trades after full size returns |
+| `PROBATION_RAMP_ENABLED` | `true` | Graduated re-entry after recovery (false = old snap-back to full) |
+| `PROBATION_WIN_STREAK` | `2` | Consecutive wins at a rung that advance one step |
+| `PROBATION_WIN_RATE_MIN` | `0.60` | ...or rolling win rate that advances one step (either fires) |
+| `PROBATION_WINRATE_MIN_TRADES` | `4` | Min settled ramp trades before the win-rate path can fire |
+| `PROBATION_RUNGS` | _(auto)_ | Explicit sub-full base sizes, e.g. `100,250` (else `[floor, full/2]`) |
+| `PROBATION_STATE_PATH` | `probation_state.json` | Persistence file |
+| `PROBATION_PERSIST` | `true` | Toggle JSON persistence |
 
 ---
 

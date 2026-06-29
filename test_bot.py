@@ -1257,3 +1257,266 @@ class TestOnTradeSettledRecoveryEntry:
             assert lad.get_stake(5.0).multiplier == 1.0   # held at baseline
             lad.on_trade_result(True, 2.0)
         assert lad.get_stake(5.0).multiplier > 1.0        # resumes after 5
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROBATION RAMP (post-recovery graduated re-entry — 2026-06-29 log-review fix)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestProbationRungs:
+    """The ramp's sub-full base sizes: auto-built or explicitly overridden,
+    always clamped to [RECOVERY_TRADE_SIZE, NORMAL_TRADE_SIZE)."""
+
+    def test_auto_default_is_floor_and_half(self, monkeypatch):
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
+        assert bot._probation_rungs() == [100.0, 250.0]
+
+    def test_explicit_override_prepends_floor(self, monkeypatch):
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "150,300")
+        assert bot._probation_rungs() == [100.0, 150.0, 300.0]
+
+    def test_override_clamps_out_of_range(self, monkeypatch):
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        # 50 < floor (dropped); 500/900 ≥ full (dropped); floor prepended.
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "50,250,500,900")
+        assert bot._probation_rungs() == [100.0, 250.0]
+
+    def test_no_room_when_normal_le_recovery(self, monkeypatch):
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
+        assert bot._probation_rungs() == []
+
+
+class TestProbationState:
+    """Unit tests for the graduated-re-entry ramp in isolation (persist=False)."""
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def _ps(self):
+        return bot.ProbationState(path="unused.json", persist=False)
+
+    def _cfg(self, monkeypatch, streak=2, wr=0.60, wr_n=4, enabled=True):
+        monkeypatch.setattr(bot, "PROBATION_RAMP_ENABLED", enabled)
+        monkeypatch.setattr(bot, "PROBATION_WIN_STREAK", streak)
+        monkeypatch.setattr(bot, "PROBATION_WIN_RATE_MIN", wr)
+        monkeypatch.setattr(bot, "PROBATION_WINRATE_MIN_TRADES", wr_n)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+
+    def test_start_sets_floor_and_active(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        ps = self._ps()
+        assert ps.start([100.0, 250.0], 500.0) is True
+        assert ps.active is True
+        assert ps.current_size() == 100.0
+
+    def test_start_noop_when_disabled(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch, enabled=False)
+        ps = self._ps()
+        assert ps.start([100.0, 250.0], 500.0) is False
+        assert ps.active is False
+
+    def test_start_noop_when_no_subfull_rungs(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        ps = self._ps()
+        assert ps.start([], 500.0) is False
+        assert ps.start([500.0], 500.0) is False   # only a full-size rung → no room
+
+    def test_win_streak_advances_one_rung(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch, streak=2)
+        ps = self._ps(); ps.start([100.0, 250.0], 500.0)
+        ps.record_result(True)               # streak 1 — not yet
+        assert ps.current_size() == 100.0
+        ps.record_result(True)               # streak 2 — advance
+        assert ps.current_size() == 250.0
+        assert ps.level == 1
+        assert ps.streak == 0                # must re-prove at the larger size
+
+    def test_loss_steps_down_one_rung(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch, streak=2)
+        ps = self._ps(); ps.start([100.0, 250.0], 500.0)
+        ps.record_result(True); ps.record_result(True)   # → rung 250
+        assert ps.current_size() == 250.0
+        ps.record_result(False)              # loss → step down to floor
+        assert ps.current_size() == 100.0
+        assert ps.level == 0
+
+    def test_loss_at_floor_holds(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        ps = self._ps(); ps.start([100.0, 250.0], 500.0)
+        ps.record_result(False)
+        assert ps.active is True
+        assert ps.current_size() == 100.0    # never below the recovery floor
+
+    def test_graduates_at_top_rung(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch, streak=2)
+        ps = self._ps(); ps.start([100.0, 250.0], 500.0)
+        ps.record_result(True); ps.record_result(True)   # floor → 250 (top rung)
+        ps.record_result(True); ps.record_result(True)   # top rung proven → graduate
+        assert ps.active is False
+        assert ps.current_size() == 500.0    # full size restored
+
+    def test_winrate_path_advances_without_streak(self, monkeypatch):
+        # Streak gate unreachable; only the rolling win-rate path can fire.
+        self._no_telegram(monkeypatch)
+        self._cfg(monkeypatch, streak=99, wr=0.60, wr_n=4)
+        ps = self._ps(); ps.start([100.0, 250.0], 500.0)
+        ps.record_result(True)               # n=1
+        ps.record_result(True)               # n=2
+        ps.record_result(False)              # n=3 (floor hold), 2/3
+        assert ps.level == 0
+        ps.record_result(True)               # n=4, 3/4=75% ≥ 60% → advance
+        assert ps.level == 1
+
+    def test_cancel_drops_ramp(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        ps = self._ps(); ps.start([100.0, 250.0], 500.0)
+        ps.cancel()
+        assert ps.active is False
+        assert ps.current_size() == 500.0
+
+    def test_reconcile_clamps_level(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        ps = self._ps()
+        ps.active = True; ps.rungs = [100.0, 250.0]; ps.full_size = 500.0
+        ps.level = 9                         # corrupt
+        ps.reconcile_on_boot()
+        assert ps.level == 1
+
+    def test_reconcile_clears_corrupt_ramp(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        ps = self._ps()
+        ps.active = True; ps.rungs = []; ps.full_size = 0.0
+        ps.reconcile_on_boot()
+        assert ps.active is False
+
+    def test_persistence_round_trip(self, monkeypatch, tmp_path):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        path = str(tmp_path / "probation_state.json")
+        ps1 = bot.ProbationState(path=path, persist=True)
+        ps1.start([100.0, 250.0], 500.0)
+        ps1.record_result(True); ps1.record_result(True)   # → rung 250
+        ps2 = bot.ProbationState(path=path, persist=True)
+        assert ps2.active is True
+        assert ps2.current_size() == 250.0
+        assert ps2.level == 1
+
+
+class TestActiveTradeSizeProbation:
+    """active_trade_size() priority: recovery → probation → normal."""
+
+    def setup_method(self):
+        bot.recovery.active = False
+        bot.recovery.target_balance = 0.0
+        bot.probation.active = False
+
+    def teardown_method(self):
+        bot.recovery.active = False
+        bot.probation.active = False
+
+    def test_probation_size_when_active(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.probation.active = True
+        bot.probation.rungs = [100.0, 250.0]
+        bot.probation.level = 0
+        bot.probation.full_size = 500.0
+        assert bot.active_trade_size() == 100.0
+        assert bot.in_clawback() is True
+
+    def test_recovery_takes_precedence(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        bot.recovery.active = True
+        bot.probation.active = True
+        bot.probation.rungs = [250.0]
+        bot.probation.level = 0
+        bot.probation.full_size = 500.0
+        assert bot.active_trade_size() == 100.0   # recovery wins
+
+
+class TestClawbackLadderCap:
+    """The 2026-06-29 leak: while clawing back (recovery OR probation), the
+    laddering overlay must never size the stake UP, even on a hot win record."""
+
+    def setup_method(self):
+        bot.recovery.active = False
+        bot.probation.active = False
+
+    def teardown_method(self):
+        bot.stake_ladder = None
+        bot.recovery.active = False
+        bot.probation.active = False
+
+    def _hot_ladder(self):
+        clk = _FakeClock()
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=10,
+                                           max_multiplier=2.0, cooldown_secs=0),
+                          clock=clk)
+        for _ in range(12):
+            lad.on_trade_result(True, 2.0)
+            clk.advance(60)
+        return lad
+
+    def test_normal_mode_allows_size_up(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 100.0)
+        bot.stake_ladder = self._hot_ladder()
+        bet = bot.kelly_bet(0.65, 50, 100_000.0)
+        assert bet > 100.0   # 2× tier sizes the flat stake up
+
+    def test_recovery_caps_at_base(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        bot.recovery.active = True
+        bot.stake_ladder = self._hot_ladder()
+        bet = bot.kelly_bet(0.65, 50, 100_000.0)
+        assert bet == 100.0   # capped at base — no $200 leak
+
+    def test_probation_caps_at_current_rung(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.probation.active = True
+        bot.probation.rungs = [100.0, 250.0]
+        bot.probation.level = 1            # base $250
+        bot.probation.full_size = 500.0
+        bot.stake_ladder = self._hot_ladder()
+        bet = bot.kelly_bet(0.65, 50, 100_000.0)
+        assert bet == 250.0   # capped at the current rung, not 2×
+
+
+class TestProbationRecordHook:
+    """The settlement hook only advances/steps for probation-mode trades."""
+
+    def setup_method(self):
+        bot.probation._persist = False
+        bot.probation.active = False
+
+    def teardown_method(self):
+        bot.probation.active = False
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def _start(self, monkeypatch):
+        monkeypatch.setattr(bot, "PROBATION_RAMP_ENABLED", True)
+        monkeypatch.setattr(bot, "PROBATION_WIN_STREAK", 2)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.probation.start([100.0, 250.0], 500.0)
+
+    def test_probation_trade_advances(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._start(monkeypatch)
+        rec = {"mode_at_entry": "probation"}
+        bot.probation_record(True, rec)
+        bot.probation_record(True, rec)
+        assert bot.probation.current_size() == 250.0
+
+    def test_non_probation_trade_ignored(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._start(monkeypatch)
+        bot.probation_record(True, {"mode_at_entry": "normal"})
+        bot.probation_record(True, {"mode_at_entry": "normal"})
+        assert bot.probation.current_size() == 100.0   # unchanged
