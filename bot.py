@@ -1,7 +1,29 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.6.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.7.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.7.0 — AUTONOMOUS SIZING & GOVERNORS: the bot runs on its own again.       ║
+║                                                                              ║
+║  The v9.4.x owner directives hard-coded a FLAT $500 stake that fired         ║
+║  regardless of bankroll and stripped out the daily-loss / balance-floor      ║
+║  halts. v9.7.0 hands risk management back to the bot:                        ║
+║    1. kelly_bet(): stake = fractional Kelly (full_kelly × KELLY_FRACTION ×    ║
+║       balance) clamped by the mode ceiling active_trade_size(), MAX_BET_      ║
+║       FRACTION × balance, and cash on hand. The bet scales DOWN on its own    ║
+║       as the edge weakens or the account draws down. NORMAL_TRADE_SIZE is     ║
+║       now a per-trade CEILING, not a flat stake.                             ║
+║    2. daily_loss_check(): the min($,%) daily-loss halt is restored.          ║
+║    3. balance_floor_check(): restored (function + run_decision call).        ║
+║  The 40% SESSION_STOP_FRACTION halt stays always-on. Recovery Mode +         ║
+║  probation ramp (v9.5.0/v9.6.0) remain the response to a full-size loss; the ║
+║  ceiling they set still binds the autonomous stake.                         ║
+║                                                                              ║
+║  Each switch is env-toggleable so the old flat behavior is one Railway var   ║
+║  away — KELLY_SIZING / DAILY_LOSS_GUARD / BALANCE_FLOOR_GUARD (all default    ║
+║  true). Set them false to restore v9.4.x. Tunables: KELLY_FRACTION (0.30),   ║
+║  MAX_BET_FRACTION (0.04), MAX_DAILY_LOSS_DOLLARS, MAX_DAILY_LOSS_PCT (0.06),  ║
+║  MIN_BALANCE_FLOOR (5).                                                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.6.0 — PROBATION RAMP: graduated re-entry after recovery (log-review fix).║
 ║                                                                              ║
@@ -261,7 +283,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.6.0"
+BOT_VERSION = "9.7.0"
 
 import base64
 import json
@@ -366,6 +388,24 @@ RECOVERY_TRADE_SIZE = _env_float("RECOVERY_TRADE_SIZE", 100.0)
 MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.04)
 KELLY_FRACTION      = _env_float("KELLY_FRACTION", 0.30)
 KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
+
+# ── Autonomous sizing & governors (v9.7.0) ────────────────────────────────────
+# The v9.4.x owner directives hard-coded a FLAT stake that fired regardless of
+# bankroll and stripped out the daily-loss / balance-floor halts. v9.7.0 hands
+# risk management back to the bot so it self-governs. Each switch defaults to the
+# autonomous behavior but can be flipped back in Railway WITHOUT a code change:
+#   • KELLY_SIZING        — True: stake = fractional Kelly (full_kelly ×
+#       KELLY_FRACTION × balance) clamped by the mode ceiling active_trade_size(),
+#       MAX_BET_FRACTION × balance, and cash on hand. Scales DOWN as the edge
+#       weakens or the account shrinks. False: legacy flat active_trade_size().
+#   • DAILY_LOSS_GUARD    — re-enable the min($,%) daily-loss halt.
+#   • BALANCE_FLOOR_GUARD — re-enable the minimum-balance trade block.
+# The 40% SESSION_STOP_FRACTION catastrophic halt is always on, independent of
+# these. The post-loss Recovery Mode + probation ramp (v9.5.0/v9.6.0) remain the
+# behavioral response to a realized full-size loss.
+KELLY_SIZING        = _env_bool("KELLY_SIZING", True)
+DAILY_LOSS_GUARD    = _env_bool("DAILY_LOSS_GUARD", True)
+BALANCE_FLOOR_GUARD = _env_bool("BALANCE_FLOOR_GUARD", True)
 
 # ── Recovery Mode persistence ─────────────────────────────────────────────────
 # Where the recovery state (active flag + target balance) is written so it
@@ -1526,28 +1566,43 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
         return 0.0
     b          = (100 - contract_price_cents) / float(contract_price_cents)
     full_kelly = max(0.0, (b * win_prob - (1.0 - win_prob)) / b)
-    # v9.4.1 (owner directive): FLAT stake. Kelly is used ONLY as an edge gate —
-    # a positive full_kelly means the bet has positive expectancy. The stake size
-    # itself is the full active trade size regardless of balance (no Kelly or
-    # MAX_BET_FRACTION down-scaling), so trades fire at any bankroll. The only
-    # clamp is the cash on hand: you cannot stake more than the account holds.
-    # v9.5.0: the stake is derived from the current mode via active_trade_size()
-    # (NORMAL_TRADE_SIZE normally, RECOVERY_TRADE_SIZE while in recovery).
+    # A non-positive full_kelly means the bet has no positive expectancy → skip.
     if full_kelly <= 0.0:
         return 0.0
-    size     = active_trade_size()
-    base_bet = round(min(size, balance), 2)
 
-    # Laddering overlay (opt-in). Scales the flat stake by a performance
-    # multiplier, but never past 2× the active trade size or the cash on hand.
-    # While clawing back a loss (recovery OR the post-recovery probation ramp)
-    # the ceiling is the active base itself: the ladder may size DOWN on a cold
-    # streak but can NEVER size UP, so a win rate banked at small stakes can't
-    # re-arm full size in one jump (the 2026-06-29 "$100 base × 2.0 = $200 in
-    # recovery" leak).
+    # active_trade_size() is the per-trade dollar CEILING for the current mode
+    # (NORMAL_TRADE_SIZE normally; the reduced RECOVERY_TRADE_SIZE or a probation
+    # rung while clawing back a loss). It is a cap, not the stake itself.
+    size = active_trade_size()
+
+    if KELLY_SIZING:
+        # v9.7.0 AUTONOMOUS: stake = fractional Kelly × bankroll, clamped by the
+        # mode ceiling, the per-bet balance fraction, and cash on hand. The bet
+        # shrinks on its own as the edge weakens or the account draws down — no
+        # owner directive required.
+        kelly_stake = full_kelly * KELLY_FRACTION * balance
+        base_bet    = round(min(kelly_stake, size,
+                                balance * MAX_BET_FRACTION, balance), 2)
+    else:
+        # Legacy FLAT stake (v9.4.1 owner directive): full mode size, only the
+        # cash-on-hand clamp. Restored by setting KELLY_SIZING=false.
+        base_bet = round(min(size, balance), 2)
+
+    if base_bet <= 0.0:
+        return 0.0
+
+    # Laddering overlay (opt-in). Scales the stake by a performance multiplier,
+    # but never past 2× the mode ceiling, the per-bet balance fraction (autonomous
+    # mode), or the cash on hand. While clawing back a loss (recovery OR the
+    # probation ramp) the ceiling is the mode base itself: the ladder may size
+    # DOWN on a cold streak but can NEVER size UP, so a win rate banked at small
+    # stakes can't re-arm full size in one jump (the 2026-06-29 "$100 × 2.0 =
+    # $200 in recovery" leak).
     if stake_ladder is not None:
         cap_mult = 1.0 if in_clawback() else stake_ladder.cfg.max_multiplier
         ceiling  = min(cap_mult * size, balance)
+        if KELLY_SIZING:
+            ceiling = min(ceiling, balance * MAX_BET_FRACTION)
         decision = stake_ladder.get_stake(base_bet, max_stake=ceiling)
         return decision.stake
 
@@ -2130,14 +2185,37 @@ def minutes_to_expiry(market: dict) -> float:
 # GUARD STACK
 # ─────────────────────────────────────────────────────────────────────────────
 
+def balance_floor_check(balance: float) -> bool:
+    # v9.7.0: restored. Blocks NEW trades once the account falls below the floor,
+    # so a cold streak can't grind the bankroll to dust. Toggle with
+    # BALANCE_FLOOR_GUARD=false to restore the v9.4.0 no-floor behavior.
+    if BALANCE_FLOOR_GUARD and balance < MIN_BALANCE_FLOOR:
+        log.warning("BALANCE FLOOR │ $%.2f < $%.2f", balance, MIN_BALANCE_FLOOR)
+        return False
+    return True
+
+
 def daily_loss_check(balance: float) -> bool:
-    # Daily-loss governors (the % and $ caps) and the balance floor were removed
-    # by owner directive: the only active auto-hold is the consecutive-loss
-    # streak pause (streak_check). The 40% session-stop is retained as a
-    # catastrophic backstop only.
+    # v9.7.0: the % and $ daily-loss governors are restored (DAILY_LOSS_GUARD,
+    # default on) so one bad UTC day is bounded autonomously; the 40% session
+    # stop remains an always-on catastrophic backstop. Set DAILY_LOSS_GUARD=false
+    # to restore the v9.4.0 "session-stop only" behavior.
     global _session_halted
     if _session_halted:
         return False
+    if DAILY_LOSS_GUARD:
+        # v9.3.1: LIVE reads realized-only PnL (an unsettled position's outlay
+        # must contribute 0). Halt on the tighter of the fixed $ cap and a % of
+        # the session-start balance — the $15 default never bound on a ~$1969
+        # bankroll, so a cold streak ran to −$246.87 (12.5%) before it tripped.
+        pnl      = paper_daily_pnl if DEMO_MODE else live_daily_realized
+        pct_cap  = MAX_DAILY_LOSS_PCT * session_start_balance if session_start_balance > 0 else 0.0
+        loss_cap = min(MAX_DAILY_LOSS, pct_cap) if pct_cap > 0 else MAX_DAILY_LOSS
+        if pnl <= -loss_cap:
+            _session_halted = True
+            log.warning("DAILY LOSS │ $%.2f ≥ cap $%.2f — halted.", abs(pnl), loss_cap)
+            telegram_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
+            return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
         _session_halted = True
         log.warning("SESSION STOP │ $%.2f < $%.2f — halted.", balance, session_stop_threshold)
@@ -2359,6 +2437,9 @@ def run_decision(market: dict, balance: float) -> None:
         last_signal_desc = f"session re-entry ({ticker[-10:]})"
         return
     if not cooldown_check():
+        return
+    if not balance_floor_check(balance):
+        last_signal_desc = f"balance floor (${balance:.0f}<${MIN_BALANCE_FLOOR:.0f})"
         return
     if not daily_loss_check(balance):
         return
@@ -2609,14 +2690,19 @@ def main() -> None:
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
     log.info("  Momentum lookback=%d intervals | thresh≥%.2f%% or R²≥%.2f",
              MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
-    log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
+    log.info("  Sizing: %s | ceiling normal=$%.0f recovery=$%.0f | active=$%.0f%s",
+             "AUTONOMOUS Kelly×%.2f (≤%.0f%% bankroll)" % (KELLY_FRACTION, MAX_BET_FRACTION * 100)
+             if KELLY_SIZING else "FLAT",
              NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
              " (RECOVERY active, target $%.2f)" % recovery.target_balance
              if recovery.active else
              " (PROBATION ramp, rung $%.0f→full $%.0f)"
              % (probation.current_size(), NORMAL_TRADE_SIZE)
              if probation.active else "")
-    log.info("  Kelly=%.2f | SessionScore≥%d", KELLY_FRACTION, MIN_SESSION_SCORE)
+    log.info("  Guards: dailyLoss=%s floor=%s($%.0f) sessionStop=%.0f%% | SessionScore≥%d",
+             "ON" if DAILY_LOSS_GUARD else "off",
+             "ON" if BALANCE_FLOOR_GUARD else "off", MIN_BALANCE_FLOOR,
+             SESSION_STOP_FRACTION * 100, MIN_SESSION_SCORE)
     log.info("━" * 70)
 
     tg.validate_telegram_connection()

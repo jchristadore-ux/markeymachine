@@ -27,14 +27,14 @@ Compares the current order book snapshot to the previous one for each ticker. Tr
 ### v5.3.0: Multi-Market Scanner
 Scans ALL open BTC markets across KXBTC15M/KXBTCD/KXBTC series and evaluates each for signals. The bot tries every valid market per cycle instead of just picking the one closest to 50c. Position guard and cooldown prevent over-trading.
 
-### Sizing — Flat Stake with Recovery Mode *(v9.5.0)*
+### Sizing — Autonomous Fractional Kelly with Recovery Mode *(v9.7.0)*
 `f* = (b×p - q) / b` where b = net odds, p = OB win probability, q = 1-p.
-Kelly is used **only as an edge gate** (`f* > 0` ⇒ positive expectancy). The stake is **flat on every qualifying trade, regardless of balance** — no Kelly or balance-fraction down-scaling; the only clamp is cash on hand.
+A non-positive `f*` skips the trade. With **autonomous sizing** (`KELLY_SIZING=true`, default) the stake is **`f* × KELLY_FRACTION × balance`**, clamped by the mode ceiling, `MAX_BET_FRACTION × balance`, and cash on hand — so the bet **scales down on its own** as the edge weakens or the account draws down. Set `KELLY_SIZING=false` to restore the v9.4.1 flat stake (full mode size, cash-clamp only).
 
-The stake is **derived from a persistent mode** via `active_trade_size()`:
+The per-trade **ceiling** is **derived from a persistent mode** via `active_trade_size()`:
 
-- **Normal mode** → `NORMAL_TRADE_SIZE` (default $500; falls back to legacy `TRADE_SIZE_DOLLARS`).
-- **Recovery mode** → `RECOVERY_TRADE_SIZE` (default $100). Activated when a full-size trade settles a loss; the recovery target is the realized balance *immediately before that trade*. The bot trades at the reduced size until balance climbs back to the target, then auto-resumes full size.
+- **Normal mode** → `NORMAL_TRADE_SIZE` (default $500; falls back to legacy `TRADE_SIZE_DOLLARS`). Now a *ceiling* Kelly fills up to, not a flat stake.
+- **Recovery mode** → `RECOVERY_TRADE_SIZE` (default $100). Activated when a full-size trade settles a loss; the recovery target is the realized balance *immediately before that trade*. The bot trades at the reduced size until balance climbs back to the target, then enters the **probation ramp** (v9.6.0) — climbing `$100 → $250 → $500` only as the edge re-proves itself — before full size resumes.
 
 Recovery state `{active, target}` is persisted atomically and reconciled on boot, so it survives an in-container restart and can never wedge. See [`TRADING_DOCTRINE.md`](TRADING_DOCTRINE.md) §5 for the full lifecycle and edge-case guarantees. **For redeploy-durable recovery state on Railway, mount a Volume and set `RECOVERY_STATE_PATH` to a path on it.**
 
@@ -52,17 +52,24 @@ A performance-driven overlay on the Kelly stake that scales trade size by a mult
 
 | Control | Behavior |
 |---|---|
-| **Recovery mode** *(v9.5.0)* | After a full-size loss, drops to `RECOVERY_TRADE_SIZE` until balance recovers to the pre-loss level, then auto-resumes `NORMAL_TRADE_SIZE`. Persistent across restarts |
-| **Streak filter** *(only active auto-hold)* | After `MAX_CONSEC_LOSSES` (3) consecutive losses, pauses trading for `STREAK_PAUSE_SECS` then resets the counter |
+| **Recovery mode** *(v9.5.0)* | After a full-size loss, drops to `RECOVERY_TRADE_SIZE`, then graduated **probation ramp** (v9.6.0) back to full size. Persistent across restarts |
+| **Daily-loss halt** *(v9.7.0, `DAILY_LOSS_GUARD`)* | Halts for the UTC day when the session loses `min($ MAX_DAILY_LOSS_DOLLARS, % MAX_DAILY_LOSS_PCT × start)` |
+| **Balance floor** *(v9.7.0, `BALANCE_FLOOR_GUARD`)* | Blocks new trades below `MIN_BALANCE_FLOOR` |
+| **Streak filter** | After `MAX_CONSEC_LOSSES` (3) consecutive losses, pauses trading for `STREAK_PAUSE_SECS` then resets the counter |
 | Session stop *(catastrophic backstop)* | Halts if balance drops below `SESSION_STOP_FRACTION` (40%) of session-start balance |
 | Position guard | One entry per market ticker, no re-entry until expiry |
 | Expiry guard | Skips contracts priced >85c or <15c (near-certain outcome, zero EV) |
 | Spread guard | Skips zero/crossed spreads (broken book) |
 
-> **Removed (v9.4.0, owner directive):** the % and $ daily-loss caps, the
-> balance floor, and RECOVERY mode (10% drawdown sizing cut). The consecutive-loss
-> streak pause is the only active auto-hold; the 40% session stop is retained
-> only as a catastrophic backstop.
+> **v9.7.0 — autonomous restore:** the % and $ daily-loss caps and the balance
+> floor (removed by the v9.4.0 owner directive) are back on by default, and
+> sizing is fractional-Kelly again. Each is one Railway var from the old flat
+> behavior — `KELLY_SIZING` / `DAILY_LOSS_GUARD` / `BALANCE_FLOOR_GUARD` (set
+> `false` to revert).
+>
+> ⚠️ **Tune `MAX_DAILY_LOSS_DOLLARS` before going live** — the legacy default
+> ($15) will halt almost immediately on a multi-hundred-dollar book. Set it to a
+> sane daily budget (or high, to let `MAX_DAILY_LOSS_PCT` govern).
 | **Liquidity filter** *(v5.3.0)* | Skips low-liquidity UTC hours (default 4-8 UTC / midnight-4am ET) |
 | **Concurrent limit** *(v5.3.0)* | Max simultaneous open positions (default 2) |
 | **Stale cancel** *(v5.3.0)* | Auto-cancels unfilled orders after timeout (default 300s) |
@@ -151,12 +158,18 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `RECOVERY_STATE_PATH` | `recovery_state.json` | Where recovery state is persisted. Point at a mounted Railway **Volume** (e.g. `/data/recovery_state.json`) to survive redeploys |
 | `RECOVERY_PERSIST` | `true` | Set `false` to disable recovery-state persistence |
 | `RECOVERY_LADDER_PAUSE_TRADES` | `5` | After recovery exits and sizing returns to `NORMAL_TRADE_SIZE`, hold the ladder's win-rate size-up at baseline for this many fresh trades (win or loss) before it can scale above normal again. `0` disables. No effect unless `LADDER_ENABLED=true` |
-| `TRADE_SIZE_DOLLARS` | `500` | Legacy flat stake; now the default for `NORMAL_TRADE_SIZE` |
-| `MAX_BET_FRACTION` | `1.0` | **Dead config (v9.4.1)** — flat sizing ignores it |
+| `TRADE_SIZE_DOLLARS` | `500` | Legacy flat stake; now the default ceiling for `NORMAL_TRADE_SIZE` |
+| `KELLY_SIZING` | `true` | **v9.7.0** Autonomous fractional-Kelly sizing. `false` = legacy flat stake |
+| `KELLY_FRACTION` | `0.30` | Fraction of full Kelly staked (v9.7.0: scales stake again, not just a gate) |
+| `MAX_BET_FRACTION` | `0.04` | Per-bet cap as a fraction of balance (live again under `KELLY_SIZING`) |
+| `DAILY_LOSS_GUARD` | `true` | **v9.7.0** Re-enable the daily-loss halt. `false` = v9.4.0 session-stop-only |
+| `MAX_DAILY_LOSS_DOLLARS` | `15` | ⚠️ Daily-loss `$` cap — **raise this** for a multi-hundred-dollar book |
+| `MAX_DAILY_LOSS_PCT` | `0.06` | Daily-loss `%`-of-start cap; the tighter of `$`/`%` binds |
+| `BALANCE_FLOOR_GUARD` | `true` | **v9.7.0** Re-enable the balance floor. `false` = no floor |
+| `MIN_BALANCE_FLOOR` | `5` | Block new trades below this balance (when `BALANCE_FLOOR_GUARD`) |
 | `SESSION_STOP_FRACTION` | `0.40` | Catastrophic backstop — halt below this fraction of session-start balance |
 | `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |
-| `KELLY_FRACTION` | `0.30` | v9.4.1: only gates edge (`>0`); no longer scales stake size |
-| `MAX_CONSEC_LOSSES` | `3` | Streak pause threshold — the only active auto-hold |
+| `MAX_CONSEC_LOSSES` | `3` | Streak pause threshold |
 | `PAPER_BALANCE` | `25.0` | Starting balance in paper mode |
 | `POLL_INTERVAL_SECS` | `30` | Market scan frequency |
 | `TELEGRAM_BOT_TOKEN` | optional | From @BotFather |

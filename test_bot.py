@@ -204,25 +204,41 @@ class TestRestoredThresholds:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestDailyLossCheck:
-    """v9.4.0: the % and $ daily-loss governors were removed by owner directive.
-    daily_loss_check() now enforces ONLY the 40% catastrophic session stop; the
-    consecutive-loss streak pause (streak_check) is the active auto-hold."""
+    """v9.7.0: the % and $ daily-loss governors are restored (DAILY_LOSS_GUARD,
+    default on); the 40% catastrophic session stop remains always-on. Set
+    DAILY_LOSS_GUARD=false to restore the v9.4.0 session-stop-only behavior."""
 
     def setup_method(self):
         bot._session_halted = False
 
-    def test_large_paper_loss_no_longer_halts(self, monkeypatch):
-        # A deep daily drawdown must NOT halt now that the daily caps are gone.
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def test_large_paper_loss_halts(self, monkeypatch):
+        # v9.7.0: a deep daily drawdown halts again now the daily cap is back.
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "DAILY_LOSS_GUARD", True)
         monkeypatch.setattr(bot, "DEMO_MODE", True)
         monkeypatch.setattr(bot, "paper_daily_pnl", -5000.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        assert bot.daily_loss_check(1000.0) is True
-        assert bot._session_halted is False
+        assert bot.daily_loss_check(1000.0) is False
+        assert bot._session_halted is True
 
-    def test_large_realized_loss_no_longer_halts(self, monkeypatch):
-        # Same in LIVE mode: realized drawdown alone no longer trips a breaker.
+    def test_large_realized_loss_halts(self, monkeypatch):
+        # Same in LIVE mode: realized daily drawdown trips the restored breaker.
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "DAILY_LOSS_GUARD", True)
         monkeypatch.setattr(bot, "DEMO_MODE", False)
         monkeypatch.setattr(bot, "live_daily_realized", -5000.0)
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        assert bot.daily_loss_check(1000.0) is False
+        assert bot._session_halted is True
+
+    def test_guard_off_restores_no_daily_halt(self, monkeypatch):
+        # DAILY_LOSS_GUARD=false → only the session stop can halt (v9.4.0 mode).
+        monkeypatch.setattr(bot, "DAILY_LOSS_GUARD", False)
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "paper_daily_pnl", -5000.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
         assert bot.daily_loss_check(1000.0) is True
         assert bot._session_halted is False
@@ -254,6 +270,27 @@ class TestDailyLossCheck:
         assert bot._session_halted is True
         # Even with high balance, stays halted
         assert bot.daily_loss_check(50.0) is False
+
+
+class TestBalanceFloorCheck:
+    """v9.7.0: the minimum-balance trade block is restored (BALANCE_FLOOR_GUARD,
+    default on). Toggle it off to restore the v9.4.0 no-floor behavior."""
+
+    def test_below_floor_blocks(self, monkeypatch):
+        monkeypatch.setattr(bot, "BALANCE_FLOOR_GUARD", True)
+        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
+        assert bot.balance_floor_check(4.99) is False
+
+    def test_at_or_above_floor_ok(self, monkeypatch):
+        monkeypatch.setattr(bot, "BALANCE_FLOOR_GUARD", True)
+        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
+        assert bot.balance_floor_check(5.0) is True
+        assert bot.balance_floor_check(1000.0) is True
+
+    def test_guard_off_allows_any_balance(self, monkeypatch):
+        monkeypatch.setattr(bot, "BALANCE_FLOOR_GUARD", False)
+        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
+        assert bot.balance_floor_check(0.01) is True
 
 
 class TestSpreadCheck:
@@ -374,6 +411,7 @@ class TestKellyBet:
         # Sizing is now mode-derived; default every test to NORMAL mode.
         bot.recovery.active         = False
         bot.recovery.target_balance = 0.0
+        bot.probation.active        = False
 
     def test_positive_edge_returns_bet(self, monkeypatch):
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 5.0)
@@ -394,30 +432,54 @@ class TestKellyBet:
         bet = bot.kelly_bet(0.90, 40, 100.0)
         assert bet <= 2.0
 
-    def test_flat_500_on_large_bankroll(self, monkeypatch):
-        """v9.4.1: flat $500 stake on any positive-edge trade at a high balance."""
+    def test_autonomous_capped_by_bankroll_fraction(self, monkeypatch):
+        """v9.7.0: with autonomous Kelly the per-bet stake is capped at
+        MAX_BET_FRACTION × balance when that is the binding limit (not the flat
+        ceiling). Kelly would want ~$1250 here; 4% of $5000 = $200 binds."""
+        monkeypatch.setattr(bot, "KELLY_SIZING", True)
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        assert bot.kelly_bet(0.90, 40, 5000.0) == 500.0
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)
+        assert bot.kelly_bet(0.90, 40, 5000.0) == 200.0
 
-    def test_flat_500_fires_regardless_of_balance(self, monkeypatch):
-        """v9.4.1: a modest-edge trade on a small (but ≥$500) balance still
-        stakes the full $500 — no Kelly/balance down-scaling."""
+    def test_autonomous_scales_down_with_balance(self, monkeypatch):
+        """v9.7.0: the stake shrinks as the account draws down — true autonomy."""
+        monkeypatch.setattr(bot, "KELLY_SIZING", True)
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        assert bot.kelly_bet(0.70, 50, 600.0) == 500.0
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)
+        big   = bot.kelly_bet(0.70, 50, 5000.0)
+        small = bot.kelly_bet(0.70, 50, 1000.0)
+        assert small < big
 
-    def test_clamped_to_cash_when_balance_below_stake(self, monkeypatch):
-        """v9.4.1: the only clamp is cash on hand — below $500 the bot goes all-in."""
+    def test_autonomous_scales_up_with_edge(self, monkeypatch):
+        """v9.7.0: a stronger edge stakes more (until a cap binds)."""
+        monkeypatch.setattr(bot, "KELLY_SIZING", True)
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        assert bot.kelly_bet(0.70, 50, 300.0) == 300.0
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 1.0)   # disable fraction cap
+        weak   = bot.kelly_bet(0.62, 50, 1000.0)
+        strong = bot.kelly_bet(0.80, 50, 1000.0)
+        assert strong > weak
 
-    def test_recovery_mode_uses_recovery_size(self, monkeypatch):
-        """v9.5.0: while recovery is active, sizing derives from RECOVERY_TRADE_SIZE."""
+    def test_legacy_flat_when_kelly_sizing_off(self, monkeypatch):
+        """KELLY_SIZING=false restores the v9.4.1 flat stake (cash-clamp only)."""
+        monkeypatch.setattr(bot, "KELLY_SIZING", False)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)  # ignored in flat mode
+        assert bot.kelly_bet(0.90, 40, 5000.0) == 500.0     # flat, fraction ignored
+        assert bot.kelly_bet(0.70, 50, 300.0) == 300.0      # clamped to cash
+
+    def test_recovery_mode_caps_at_recovery_size(self, monkeypatch):
+        """v9.5.0/v9.7.0: while recovery is active the ceiling is
+        RECOVERY_TRADE_SIZE; here Kelly (~$1250) and the 4% cap ($200) both
+        exceed it, so the $100 recovery ceiling binds."""
+        monkeypatch.setattr(bot, "KELLY_SIZING", True)
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)
         bot.recovery.active = True
         assert bot.kelly_bet(0.90, 40, 5000.0) == 100.0
 
@@ -427,13 +489,14 @@ class TestKellyBet:
         assert bot.kelly_bet(0.70, 0, 25.0) == 0.0
         assert bot.kelly_bet(0.70, 100, 25.0) == 0.0
 
-    def test_bet_fraction_no_longer_caps(self, monkeypatch):
-        """v9.4.1: MAX_BET_FRACTION is dead config — flat sizing ignores it.
-        A small fraction must NOT shrink the stake below NORMAL_TRADE_SIZE."""
+    def test_bet_fraction_caps_in_autonomous_mode(self, monkeypatch):
+        """v9.7.0: MAX_BET_FRACTION is live again under autonomous sizing — a
+        small fraction shrinks the stake well below the NORMAL_TRADE_SIZE ceiling."""
+        monkeypatch.setattr(bot, "KELLY_SIZING", True)
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)  # would have capped at $40
-        assert bot.kelly_bet(0.90, 40, 1_000.0) == 500.0
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)  # 4% of $1000 = $40
+        assert bot.kelly_bet(0.90, 40, 1_000.0) == 40.0
 
 
 class TestComputeMomentum:
