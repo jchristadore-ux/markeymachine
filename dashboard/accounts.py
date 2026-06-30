@@ -104,15 +104,23 @@ class AccountStore:
                 json.dump({"accounts": [asdict(a) for a in self._accounts]}, f, indent=2)
             os.replace(tmp, self.path)
 
+    # Reads reload from disk first so concurrent workers/instances always see the
+    # latest accounts (mirrors the lock+reload used by add/update below).
     def all(self) -> List[Account]:
-        return list(self._accounts)
+        with _LOCK:
+            self.load()
+            return list(self._accounts)
 
     def get(self, account_id: str) -> Optional[Account]:
-        return next((a for a in self._accounts if a.id == account_id), None)
+        with _LOCK:
+            self.load()
+            return next((a for a in self._accounts if a.id == account_id), None)
 
     def for_user(self, user_id: str) -> List[Account]:
         """Every account owned by this user — the only ones they may see."""
-        return [a for a in self._accounts if a.owner_user_id == user_id]
+        with _LOCK:
+            self.load()
+            return [a for a in self._accounts if a.owner_user_id == user_id]
 
     def add(self, account: Account) -> Account:
         with _LOCK:
