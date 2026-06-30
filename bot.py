@@ -485,6 +485,28 @@ PROBATION_RUNG_STEP          = _env_float("PROBATION_RUNG_STEP", 250.0)
 HIGH_STAKE_GATE_SIZE         = _env_float("HIGH_STAKE_GATE_SIZE", 500.0)
 HIGH_STAKE_MIN_BALANCE       = _env_float("HIGH_STAKE_MIN_BALANCE", 5000.0)
 
+# ── TEMPORARY hard stake override (owner directive, 2026-06-30) ────────────────
+# A hand-managed, one-way stake ramp that PREEMPTS every other sizing mode
+# (recovery/probation/normal) until the bankroll FIRST reaches
+# TEMP_OVERRIDE_EXIT_BALANCE. Stakes start at TEMP_OVERRIDE_BASE and ratchet UP
+# by TEMP_OVERRIDE_STEP after every TEMP_OVERRIDE_WIN_STREAK consecutive settled
+# wins; a loss only clears the in-progress win streak (the size NEVER steps down
+# — this is a deliberate one-way ramp, not a clawback). The instant equity hits
+# the exit balance the override RETIRES PERMANENTLY (it never re-arms for the
+# rest of that run) and sizing reverts to the normal recovery → probation →
+# normal ladder. This is intentionally a temporary patch: the values are
+# hardcoded as defaults here. To restore stock behaviour set
+# TEMP_OVERRIDE_ENABLED=false (or delete this block plus its wiring in
+# active_trade_size / place_order / the settlement hook). By design the override
+# bypasses the high-stake balance gate — it IS the owner's explicit sizing call.
+TEMP_OVERRIDE_ENABLED      = _env_bool("TEMP_OVERRIDE_ENABLED", True)
+TEMP_OVERRIDE_BASE         = _env_float("TEMP_OVERRIDE_BASE", 200.0)
+TEMP_OVERRIDE_STEP         = _env_float("TEMP_OVERRIDE_STEP", 10.0)
+TEMP_OVERRIDE_WIN_STREAK   = _env_int("TEMP_OVERRIDE_WIN_STREAK", 2)
+TEMP_OVERRIDE_EXIT_BALANCE = _env_float("TEMP_OVERRIDE_EXIT_BALANCE", 5000.0)
+TEMP_OVERRIDE_STATE_PATH   = os.environ.get("TEMP_OVERRIDE_STATE_PATH", "temp_override_state.json")
+TEMP_OVERRIDE_PERSIST      = _env_bool("TEMP_OVERRIDE_PERSIST", True)
+
 # ── Dashboard / observability ─────────────────────────────────────────────────
 # When set, the bot writes a small JSON status snapshot once per main-loop cycle
 # (balance, PnL, W/L, active sizing mode, open positions, last signal). The web
@@ -1166,6 +1188,134 @@ probation = ProbationState(PROBATION_STATE_PATH, PROBATION_PERSIST)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEMPORARY HARD STAKE OVERRIDE  (owner directive — manual ramp to $5k)
+#
+# Mutated IN-PLACE only, never reassigned (same rule as `recovery`/`probation`).
+# Preempts every other sizing mode while live; retires for good the moment the
+# bankroll first reaches TEMP_OVERRIDE_EXIT_BALANCE. See the config block above
+# for the full rationale and how to disable it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TempStakeOverride:
+    """TEMPORARY (owner directive): a one-way manual stake ramp that preempts
+    every other sizing mode until the bankroll first reaches the exit balance.
+
+    The hard stake starts at TEMP_OVERRIDE_BASE and steps up TEMP_OVERRIDE_STEP
+    after each run of TEMP_OVERRIDE_WIN_STREAK consecutive settled wins; a loss
+    only clears the in-progress win streak (the size never steps down). Once
+    equity reaches TEMP_OVERRIDE_EXIT_BALANCE the override retires permanently
+    (`done=True`) and active_trade_size() falls back to the normal
+    recovery → probation → normal ladder. State persists (atomic JSON) so the
+    ramped size and retirement survive restarts."""
+
+    SCHEMA = 1
+
+    def __init__(self, path: str, persist: bool) -> None:
+        self.size:   float = round(TEMP_OVERRIDE_BASE, 2)  # current hard stake
+        self.streak: int   = 0     # consecutive wins since the last step-up
+        self.wins:   int   = 0     # cumulative settled wins under the override
+        self.losses: int   = 0     # cumulative settled losses under the override
+        self.done:   bool  = False # retired after equity hit the exit balance
+        self._path    = path
+        self._persist = persist
+        if self._persist:
+            self._load()
+
+    @property
+    def active(self) -> bool:
+        """Live only while enabled and not yet retired."""
+        return TEMP_OVERRIDE_ENABLED and not self.done
+
+    def current_size(self) -> float:
+        return self.size
+
+    def _retire(self, balance: float) -> None:
+        if self.done:
+            return
+        self.done = True
+        self._save()
+        log.warning("Temp override RETIRED │ balance $%.2f ≥ $%.2f — reverting to "
+                    "the normal sizing ladder.", balance, TEMP_OVERRIDE_EXIT_BALANCE)
+        tg.send_telegram_message(
+            f"🏁 TEMP STAKE OVERRIDE COMPLETE\n"
+            f"Bankroll reached ${balance:,.2f} (≥ ${TEMP_OVERRIDE_EXIT_BALANCE:,.0f}).\n"
+            f"Final hard stake was ${self.size:.2f}; sizing now reverts to the "
+            f"normal recovery → probation → normal ramp."
+        )
+
+    def check_balance(self, balance: "float | None") -> None:
+        """Retire the override the instant equity reaches the exit balance.
+        `balance is None` (no equity in scope, e.g. unit tests) is a no-op."""
+        if not self.active or balance is None:
+            return
+        if balance >= TEMP_OVERRIDE_EXIT_BALANCE:
+            self._retire(balance)
+
+    def record_result(self, won: bool, balance: "float | None" = None) -> None:
+        """Fold one settled trade into the ramp, then re-check the exit balance.
+        No-op once the override has retired."""
+        if not self.active:
+            return
+        if won:
+            self.wins   += 1
+            self.streak += 1
+            if self.streak >= TEMP_OVERRIDE_WIN_STREAK:
+                self.size   = round(self.size + TEMP_OVERRIDE_STEP, 2)
+                self.streak = 0
+                log.warning("Temp override UP → hard stake $%.2f (after %d straight wins).",
+                            self.size, TEMP_OVERRIDE_WIN_STREAK)
+                tg.send_telegram_message(
+                    f"⏫ TEMP OVERRIDE → ${self.size:.2f} "
+                    f"(+${TEMP_OVERRIDE_STEP:.0f} after {TEMP_OVERRIDE_WIN_STREAK} wins)"
+                )
+        else:
+            self.losses += 1
+            self.streak  = 0
+        self._save()
+        self.check_balance(balance)
+
+    def status_line(self) -> str:
+        n = self.wins + self.losses
+        return (f"TEMP override active. Hard stake ${self.size:.2f} "
+                f"(+${TEMP_OVERRIDE_STEP:.0f} per {TEMP_OVERRIDE_WIN_STREAK} wins, "
+                f"streak={self.streak}). Retires at ${TEMP_OVERRIDE_EXIT_BALANCE:,.0f}. n={n}.")
+
+    # ── persistence (atomic JSON write) ────────────────────────────────────────
+    def _save(self) -> None:
+        if not self._persist:
+            return
+        try:
+            tmp = f"{self._path}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "schema": self.SCHEMA,
+                    "size":   self.size,
+                    "streak": self.streak,
+                    "wins":   self.wins,
+                    "losses": self.losses,
+                    "done":   self.done,
+                }, f)
+            os.replace(tmp, self._path)   # atomic on POSIX
+        except OSError as e:
+            log.warning("TempOverride │ state save failed: %s", e)
+
+    def _load(self) -> None:
+        try:
+            with open(self._path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return
+        self.size   = round(float(d.get("size", TEMP_OVERRIDE_BASE) or TEMP_OVERRIDE_BASE), 2)
+        self.streak = int(d.get("streak", 0))
+        self.wins   = int(d.get("wins", 0))
+        self.losses = int(d.get("losses", 0))
+        self.done   = bool(d.get("done", False))
+
+
+temp_override = TempStakeOverride(TEMP_OVERRIDE_STATE_PATH, TEMP_OVERRIDE_PERSIST)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TIME-OF-DAY LEARNED PRIOR  (per-bucket Bayesian calibration — afternoon fix)
 #
 # Persists realized {wins, losses} per time-of-day bucket so the win-prob prior
@@ -1271,10 +1421,16 @@ def _balance_gated_size(size: float, balance: "float | None") -> float:
 def active_trade_size(balance: "float | None" = None) -> float:
     """The dollar stake for the current mode. Single source of truth for sizing
     — every position-sizing path derives from this, not from a raw env var.
-    Priority: recovery (deepest claw-back) → probation ramp → normal. When
-    `balance` is supplied the high-stake balance gate caps the result (see
-    _balance_gated_size); the realized stake therefore re-checks equity on every
-    trade."""
+    Priority: TEMP override (owner directive) → recovery (deepest claw-back) →
+    probation ramp → normal. When `balance` is supplied the high-stake balance
+    gate caps the result (see _balance_gated_size); the realized stake therefore
+    re-checks equity on every trade. The TEMP override bypasses that gate by
+    design and retires the instant equity reaches its exit balance."""
+    # TEMPORARY owner directive: a hard manual ramp preempts every other mode
+    # until the bankroll reaches the exit balance, then retires for good.
+    temp_override.check_balance(balance)
+    if temp_override.active:
+        return temp_override.current_size()
     if recovery.active:
         size = RECOVERY_TRADE_SIZE
     elif probation.active:
@@ -1285,10 +1441,12 @@ def active_trade_size(balance: "float | None" = None) -> float:
 
 
 def in_clawback() -> bool:
-    """True while clawing back a loss (recovery OR probation ramp). In this state
-    the laddering overlay is capped at the active base — it may size DOWN but
-    never UP — so a win rate earned at small stakes cannot re-arm full size."""
-    return recovery.active or probation.active
+    """True while clawing back a loss (recovery OR probation ramp) OR while the
+    TEMP override is pinning the stake. In this state the laddering overlay is
+    capped at the active base — it may size DOWN but never UP — so a win rate
+    earned at small stakes cannot re-arm full size, and the override's hard
+    stake cannot be scaled past its hardcoded value."""
+    return recovery.active or probation.active or temp_override.active
 
 
 def on_trade_settled(won: bool, trade_rec: dict, current_balance: float) -> None:
@@ -1312,6 +1470,14 @@ def probation_record(won: bool, trade_rec: dict, current_balance: "float | None"
     if (trade_rec or {}).get("mode_at_entry") != "probation":
         return
     probation.record_result(bool(won), current_balance)
+
+
+def temp_override_record(won: bool, current_balance: "float | None" = None) -> None:
+    """TEMP override hook, called once per settled trade. While the override is
+    live it is the dominant sizing mode (every trade is override-sized), so each
+    settled outcome feeds its win-streak ramp; `current_balance` (equity at
+    settlement) drives the exit-balance retirement check. No-op once retired."""
+    temp_override.record_result(bool(won), current_balance)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2121,6 +2287,8 @@ def resolve_open_orders() -> None:
             on_trade_settled(won, trade, paper_balance)
             # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
             probation_record(won, trade, paper_balance)
+            # TEMP override hook: feed the manual win-streak ramp / exit check.
+            temp_override_record(won, paper_balance)
 
             log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
                      ticker[-15:], side, result.upper(), sim, paper_balance)
@@ -2247,6 +2415,8 @@ def resolve_open_orders() -> None:
             on_trade_settled(won, trade, balance)
             # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
             probation_record(won, trade, balance)
+            # TEMP override hook: feed the manual win-streak ramp / exit check.
+            temp_override_record(won, balance)
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",
@@ -2465,7 +2635,8 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
     # v9.5.0: stamp the sizing mode + the realized balance immediately BEFORE
     # this trade so settlement can (a) tell a full-size loss from a recovery-size
     # loss and (b) set the recovery target to the exact pre-trade balance.
-    entry_mode = ("recovery" if recovery.active
+    entry_mode = ("override" if temp_override.active
+                  else "recovery" if recovery.active
                   else "probation" if probation.active
                   else "normal")
     # Stamp the time-of-day bucket at ENTRY so settlement scores the bucket the
@@ -2616,7 +2787,8 @@ def write_status_snapshot(balance: float) -> None:
         total = wins + losses
         # wilson_confidence already returns percentages: (rate%, lower%, upper%).
         rate_pct, lo_pct, hi_pct = wilson_confidence(wins, total) if total > 0 else (0.0, 0.0, 0.0)
-        active_mode = ("recovery" if recovery.active
+        active_mode = ("override" if temp_override.active
+                       else "recovery" if recovery.active
                        else "probation" if probation.active else "normal")
         snapshot = {
             "version": BOT_VERSION,
@@ -2934,6 +3106,9 @@ def main() -> None:
              MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
     log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
              NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
+             " (TEMP override, hard stake $%.0f → retires at $%.0f)"
+             % (temp_override.current_size(), TEMP_OVERRIDE_EXIT_BALANCE)
+             if temp_override.active else
              " (RECOVERY active, target $%.2f)" % recovery.target_balance
              if recovery.active else
              " (PROBATION ramp, rung $%.0f→full $%.0f)"
@@ -2957,6 +3132,7 @@ def main() -> None:
         session_stop_threshold = paper_balance * SESSION_STOP_FRACTION
         recovery.reconcile_on_boot(paper_balance)
         probation.reconcile_on_boot()
+        temp_override.check_balance(paper_balance)   # retire if already ≥ exit
         telegram_boot(paper_balance)
     else:
         try:
@@ -2979,6 +3155,7 @@ def main() -> None:
         live_daily_realized = 0.0
         recovery.reconcile_on_boot(bal)
         probation.reconcile_on_boot()
+        temp_override.check_balance(bal)   # retire if already ≥ exit
         telegram_boot(bal)
 
     resolve_cycle = 0
@@ -3074,7 +3251,9 @@ def main() -> None:
                         last_daily_summary_ts = time.time()
                         telegram_daily_summary(live_bal, daily_pnl, live_wins, live_losses)
 
-                if recovery.active:
+                if temp_override.active:
+                    log.info(temp_override.status_line())
+                elif recovery.active:
                     log.info(recovery.status_line(current_balance))
                 elif probation.active:
                     log.info(probation.status_line())

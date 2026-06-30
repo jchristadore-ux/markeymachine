@@ -1889,3 +1889,129 @@ class TestProbationRecordHook:
         bot.probation_record(True, {"mode_at_entry": "normal"})
         bot.probation_record(True, {"mode_at_entry": "normal"})
         assert bot.probation.current_size() == 100.0   # unchanged
+
+
+class TestTempStakeOverride:
+    """TEMPORARY owner directive: a one-way manual stake ramp that preempts every
+    other sizing mode until the bankroll first reaches the exit balance, stepping
+    up $10 after every 2 consecutive wins, then retires for good."""
+
+    def setup_method(self):
+        # The conftest autouse fixture retires the override; re-arm a clean,
+        # non-persisting copy with the hardcoded defaults for these tests.
+        bot.recovery.active = False
+        bot.probation.active = False
+        ov = bot.temp_override
+        ov._persist = False
+        ov.size = 200.0
+        ov.streak = ov.wins = ov.losses = 0
+        ov.done = False
+
+    def teardown_method(self):
+        bot.temp_override.done = True
+        bot.recovery.active = False
+        bot.probation.active = False
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def _defaults(self, monkeypatch):
+        monkeypatch.setattr(bot, "TEMP_OVERRIDE_ENABLED", True)
+        monkeypatch.setattr(bot, "TEMP_OVERRIDE_BASE", 200.0)
+        monkeypatch.setattr(bot, "TEMP_OVERRIDE_STEP", 10.0)
+        monkeypatch.setattr(bot, "TEMP_OVERRIDE_WIN_STREAK", 2)
+        monkeypatch.setattr(bot, "TEMP_OVERRIDE_EXIT_BALANCE", 5000.0)
+
+    def test_starts_at_200(self, monkeypatch):
+        self._defaults(monkeypatch)
+        assert bot.temp_override.active is True
+        assert bot.active_trade_size(1000.0) == 200.0
+
+    def test_preempts_recovery_and_probation(self, monkeypatch):
+        self._defaults(monkeypatch)
+        bot.recovery.active = True            # would normally force RECOVERY_TRADE_SIZE
+        bot.probation.active = True
+        assert bot.active_trade_size(1000.0) == 200.0
+        assert bot.in_clawback() is True
+
+    def test_steps_up_10_after_two_wins(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        bot.temp_override.record_result(True, 1000.0)
+        assert bot.temp_override.current_size() == 200.0   # one win — no step yet
+        bot.temp_override.record_result(True, 1000.0)
+        assert bot.temp_override.current_size() == 210.0   # two-win streak → +$10
+        bot.temp_override.record_result(True, 1000.0)
+        bot.temp_override.record_result(True, 1000.0)
+        assert bot.temp_override.current_size() == 220.0   # next two wins → +$10
+
+    def test_loss_resets_streak_but_not_size(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        bot.temp_override.record_result(True, 1000.0)
+        bot.temp_override.record_result(False, 1000.0)     # breaks the streak
+        bot.temp_override.record_result(True, 1000.0)
+        assert bot.temp_override.current_size() == 200.0   # only 1 win since loss
+        bot.temp_override.record_result(True, 1000.0)
+        assert bot.temp_override.current_size() == 210.0   # now a clean 2-win run
+
+    def test_retires_at_exit_balance(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        assert bot.active_trade_size(4999.0) == 200.0      # still under the line
+        assert bot.temp_override.active is True
+        # Equity reaches $5000 → override retires permanently this run.
+        bot.active_trade_size(5000.0)
+        assert bot.temp_override.active is False
+        assert bot.temp_override.done is True
+
+    def test_reverts_to_normal_after_retirement(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.temp_override.record_result(True, 5000.0)      # win that crosses $5k
+        assert bot.temp_override.active is False
+        assert bot.active_trade_size(5200.0) == 500.0      # back to the ladder
+
+    def test_record_after_retirement_is_noop(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        bot.temp_override.done = True
+        bot.temp_override.record_result(True, 1000.0)
+        bot.temp_override.record_result(True, 1000.0)
+        assert bot.temp_override.size == 200.0             # no ramping once retired
+
+    def test_disabled_flag_falls_through(self, monkeypatch):
+        self._defaults(monkeypatch)
+        monkeypatch.setattr(bot, "TEMP_OVERRIDE_ENABLED", False)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        assert bot.temp_override.active is False
+        assert bot.active_trade_size(1000.0) == 500.0
+
+    def test_kelly_bet_pins_exact_size_no_ladder_up(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        clk = _FakeClock()
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=10,
+                                           max_multiplier=2.0, cooldown_secs=0),
+                          clock=clk)
+        for _ in range(12):
+            lad.on_trade_result(True, 2.0)
+            clk.advance(60)
+        bot.stake_ladder = lad
+        try:
+            # Balance stays under the $5k exit so the override is still live.
+            bet = bot.kelly_bet(0.65, 50, 4000.0)
+            assert bet == 200.0   # override base — hot ladder cannot scale it up
+        finally:
+            bot.stake_ladder = None
+
+    def test_settlement_hook_feeds_ramp(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        bot.temp_override_record(True, 1000.0)
+        bot.temp_override_record(True, 1000.0)
+        assert bot.temp_override.current_size() == 210.0
+
+    def test_persistence_round_trip(self, monkeypatch, tmp_path):
+        self._no_telegram(monkeypatch); self._defaults(monkeypatch)
+        path = str(tmp_path / "temp_override_state.json")
+        a = bot.TempStakeOverride(path, persist=True)
+        a.record_result(True, 1000.0)
+        a.record_result(True, 1000.0)            # → $210, persisted
+        b = bot.TempStakeOverride(path, persist=True)
+        assert b.size == 210.0
+        assert b.done is False
