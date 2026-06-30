@@ -40,6 +40,8 @@ Recovery state `{active, target}` is persisted atomically and reconciled on boot
 
 - **Daily slow-roll ramp** *(v9.7.0)* → the first trade of **every** UTC trading day re-enters the probation ramp at the floor and climbs `$100 → $250 → $500` (the same `RECOVERY_TRADE_SIZE → … → NORMAL_TRADE_SIZE` rungs used after a recovery exit). It advances one rung on a `PROBATION_WIN_STREAK`-win streak **or** a `≥PROBATION_WIN_RATE_MIN` rolling win rate, steps down a rung on a loss, and graduates to full size at the top. This keeps the bot from opening a fresh day cold at full size. The re-arm is **skipped while Recovery is active** (the deeper claw-back tier wins), and a restart that crosses midnight re-arms on boot via a persisted arm-date. Disable with `PROBATION_RAMP_ENABLED=false` (every day then stays full size).
 
+- **Balance-gated $1000 ceiling** *(v9.8.0)* → set `TRADE_SIZE_DOLLARS=1000` to raise the ramp ceiling; the ladder auto-builds in `$250` steps to `$100 → $250 → $500 → $750 → $1000`. Stakes **above `HIGH_STAKE_GATE_SIZE` (default $500)** require account equity **≥ `HIGH_STAKE_MIN_BALANCE` (default $5000)**. The gate is enforced twice: a hard ceiling re-checked **every trade** at sizing time (so a balance that dips back below the line caps the next stake to `$500`), and at **ramp-advance time** so a win rate banked at `$500` cannot jump straight to `$1000` the instant balance crosses the line — the high rungs are earned one at a time. Below `$5000` the effective ceiling stays `$500`. The step size is `PROBATION_RUNG_STEP` (default `250`); an explicit `PROBATION_RUNGS` override is still honored.
+
 ### Execution — Maker Limit Orders
 Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee. Takers pay ~1% of winnings. Fee drag on taker orders: ~$5+/day at scale.
 
@@ -195,7 +197,10 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `RECOVERY_STATE_PATH` | `recovery_state.json` | Where recovery state is persisted. Point at a mounted Railway **Volume** (e.g. `/data/recovery_state.json`) to survive redeploys |
 | `RECOVERY_PERSIST` | `true` | Set `false` to disable recovery-state persistence |
 | `RECOVERY_LADDER_PAUSE_TRADES` | `5` | After recovery exits and sizing returns to `NORMAL_TRADE_SIZE`, hold the ladder's win-rate size-up at baseline for this many fresh trades (win or loss) before it can scale above normal again. `0` disables. No effect unless `LADDER_ENABLED=true` |
-| `TRADE_SIZE_DOLLARS` | `500` | Legacy flat stake; now the default for `NORMAL_TRADE_SIZE` |
+| `TRADE_SIZE_DOLLARS` | `500` | Legacy flat stake; now the default for `NORMAL_TRADE_SIZE`. Set `1000` to raise the slow-roll ceiling (v9.8.0) |
+| `HIGH_STAKE_MIN_BALANCE` | `5000` | *(v9.8.0)* Equity required before stakes above `HIGH_STAKE_GATE_SIZE` (e.g. $750/$1000) unlock. Below it the stake is capped at the gate size |
+| `HIGH_STAKE_GATE_SIZE` | `500` | *(v9.8.0)* Stakes above this dollar size are balance-gated by `HIGH_STAKE_MIN_BALANCE` |
+| `PROBATION_RUNG_STEP` | `250` | *(v9.8.0)* Dollar step for the auto-built ramp ladder (floor → … → `NORMAL_TRADE_SIZE`) |
 | `MAX_BET_FRACTION` | `1.0` | **Dead config (v9.4.1)** — flat sizing ignores it |
 | `SESSION_STOP_FRACTION` | `0.40` | Catastrophic backstop — halt below this fraction of session-start balance |
 | `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |
