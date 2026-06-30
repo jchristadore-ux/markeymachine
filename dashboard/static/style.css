@@ -82,3 +82,9 @@ textarea { font-family: ui-monospace, monospace; }
 .kv td:last-child { text-align: right; color: var(--muted); }
 
 .danger-zone { border-color: var(--danger); }
+
+.logbox {
+  background: #0c0e13; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px; overflow-x: auto; font-family: ui-monospace, monospace;
+  font-size: 12px; line-height: 1.45; color: #cdd3df; max-height: 360px; white-space: pre;
+}

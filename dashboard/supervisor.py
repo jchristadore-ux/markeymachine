@@ -169,3 +169,22 @@ class Supervisor:
             except (OSError, json.JSONDecodeError):
                 snapshot = None
         return {"running": running, "snapshot": snapshot}
+
+    def crashed(self, account: Account) -> bool:
+        """True when a worker exited WITHOUT a clean stop: its pidfile is still
+        present (stop() removes it) but the process is gone. Distinguishes a
+        crash from an intentional stop, which leaves no pidfile."""
+        pid = self._read_pid(account)
+        return bool(pid) and not self._pid_alive(pid)
+
+    def tail_log(self, account: Account, lines: int = 50) -> "list[str]":
+        """Last `lines` lines of the worker's log (stdout+stderr), oldest first.
+        Empty list if there is no log yet. Never raises."""
+        path = self._logfile(account)
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", errors="replace") as f:
+                return [ln.rstrip("\n") for ln in f.readlines()[-max(1, lines):]]
+        except OSError:
+            return []

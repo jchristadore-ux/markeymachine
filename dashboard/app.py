@@ -23,6 +23,10 @@ from formats import list_formats, FORMATS, DEFAULT_FORMAT
 from .accounts import Account, AccountStore
 from .supervisor import Supervisor
 from .users import UserStore
+from .watchdog import evaluate, start_watchdog
+
+MONITOR_TOKEN = os.environ.get("MONITOR_TOKEN", "").strip()
+WATCHDOG_STALE_SECS = int(os.environ.get("WATCHDOG_STALE_SECS", "180") or "180")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("DASHBOARD_SECRET_KEY") or secrets.token_hex(16)
@@ -275,6 +279,71 @@ def admin():
             "running": supervisor.is_running(acct),
         })
     return render_template("admin.html", rows=rows, user_count=len(users.all()))
+
+
+# ── monitoring ────────────────────────────────────────────────────────────────
+@app.route("/health")
+def health():
+    """Token-protected health of every worker. Provider-agnostic — read it off
+    the public URL (no Railway API needed). Disabled (404) unless MONITOR_TOKEN
+    is set, so it is never exposed unauthenticated."""
+    if not MONITOR_TOKEN:
+        abort(404)
+    supplied = request.args.get("token") or request.headers.get("X-Monitor-Token", "")
+    if not secrets.compare_digest(supplied, MONITOR_TOKEN):
+        abort(401)
+    store.load()
+    accounts = []
+    overall_ok = True
+    for acct in store.all():
+        h = evaluate(acct, supervisor, WATCHDOG_STALE_SECS)
+        owner = users.get(acct.owner_user_id)
+        h["owner_email"] = owner.email if owner else None
+        if h["state"] in ("crashed", "stalled"):
+            overall_ok = False
+            h["last_error"] = [ln for ln in supervisor.tail_log(acct, 40)
+                               if any(k in ln for k in
+                                      ("Error", "Traceback", "Exception", "CRITICAL", "Halt"))][-8:]
+        accounts.append(h)
+    from datetime import datetime, timezone
+    return {
+        "ok": overall_ok,
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "accounts": accounts,
+    }
+
+
+@app.route("/admin/logs")
+@admin_required
+def admin_logs():
+    rows = []
+    for acct in store.all():
+        owner = users.get(acct.owner_user_id)
+        rows.append({
+            "account": acct.public_dict(),
+            "owner_email": owner.email if owner else "(unknown)",
+            "state": evaluate(acct, supervisor, WATCHDOG_STALE_SECS)["state"],
+            "log": supervisor.tail_log(acct, 60),
+        })
+    return render_template("admin_logs.html", rows=rows)
+
+
+@app.route("/admin/api/logs")
+@admin_required
+def admin_api_logs():
+    acct = store.get(request.args.get("account", ""))
+    if not acct:
+        abort(404)
+    try:
+        lines = max(1, min(500, int(request.args.get("lines", "100"))))
+    except ValueError:
+        lines = 100
+    return {"account": acct.id, "lines": supervisor.tail_log(acct, lines)}
+
+
+# Start the background watchdog when the app module is imported (gunicorn worker
+# or `python -m dashboard.app`). Idempotent; disabled with DASHBOARD_WATCHDOG=false.
+start_watchdog(supervisor, store)
 
 
 def main():
