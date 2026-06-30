@@ -1,0 +1,19 @@
+# Railway config for the DASHBOARD service (separate from the bot service).
+#
+# Both services deploy from this same repo, and Railway's config-in-code
+# overrides the dashboard UI's "Custom Start Command" — so the bot's
+# railway.toml ("python bot.py") would otherwise win on the dashboard service
+# too and crash it (the bot requires Kalshi credentials). To avoid that, point
+# the dashboard service at THIS file:
+#   Dashboard service → Settings → Config-as-code / "Railway Config File"
+#   → set the path to:  railway.dashboard.toml   → then Redeploy.
+#
+# The bot service keeps using the default railway.toml. Nothing here touches the
+# trader.
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python -m dashboard.app"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
