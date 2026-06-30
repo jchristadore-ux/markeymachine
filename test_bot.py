@@ -413,6 +413,17 @@ class TestKellyBet:
         monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
         assert bot.kelly_bet(0.70, 50, 300.0) == 300.0
 
+    def test_high_stake_gated_below_min_balance(self, monkeypatch):
+        """v9.8.0: a $1000 ceiling is capped to $500 until equity ≥ $5000, then
+        the full stake fires."""
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 1000.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
+        monkeypatch.setattr(bot, "HIGH_STAKE_GATE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "HIGH_STAKE_MIN_BALANCE", 5000.0)
+        bot.probation.active = False
+        assert bot.kelly_bet(0.90, 40, 4000.0) == 500.0    # gated
+        assert bot.kelly_bet(0.90, 40, 6000.0) == 1000.0   # unlocked
+
     def test_recovery_mode_uses_recovery_size(self, monkeypatch):
         """v9.5.0: while recovery is active, sizing derives from RECOVERY_TRADE_SIZE."""
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
@@ -1485,13 +1496,16 @@ class TestProbationState:
     def _ps(self):
         return bot.ProbationState(path="unused.json", persist=False)
 
-    def _cfg(self, monkeypatch, streak=2, wr=0.60, wr_n=4, enabled=True):
+    def _cfg(self, monkeypatch, streak=2, wr=0.60, wr_n=4, enabled=True,
+             normal=500.0, gate_size=500.0, min_balance=5000.0):
         monkeypatch.setattr(bot, "PROBATION_RAMP_ENABLED", enabled)
         monkeypatch.setattr(bot, "PROBATION_WIN_STREAK", streak)
         monkeypatch.setattr(bot, "PROBATION_WIN_RATE_MIN", wr)
         monkeypatch.setattr(bot, "PROBATION_WINRATE_MIN_TRADES", wr_n)
-        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", normal)
         monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "HIGH_STAKE_GATE_SIZE", gate_size)
+        monkeypatch.setattr(bot, "HIGH_STAKE_MIN_BALANCE", min_balance)
 
     def test_start_sets_floor_and_active(self, monkeypatch):
         self._no_telegram(monkeypatch); self._cfg(monkeypatch)
@@ -1633,6 +1647,135 @@ class TestProbationState:
             assert ps.level == 1                   # recovery deeper → ramp untouched
         finally:
             bot.recovery.active = False
+
+    # ── v9.8.0: balance-gated advancement to the high ($750/$1000) rungs ────────
+    def test_advance_into_high_rung_blocked_below_min_balance(self, monkeypatch):
+        # At the $500 rung with the win gate met, the next rung ($750) is gated:
+        # below $5000 the ramp HOLDS at $500 and keeps the streak.
+        self._no_telegram(monkeypatch)
+        self._cfg(monkeypatch, streak=2, normal=1000.0)
+        ps = self._ps(); ps.start([100.0, 250.0, 500.0, 750.0], 1000.0)
+        ps.level = 2                              # sitting at $500
+        ps.record_result(True, balance=4000.0)   # streak 1
+        ps.record_result(True, balance=4000.0)   # streak 2, gate met — but gated
+        assert ps.current_size() == 500.0
+        assert ps.level == 2
+        assert ps.streak == 2                     # streak preserved for later
+
+    def test_advance_into_high_rung_allowed_at_min_balance(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        self._cfg(monkeypatch, streak=2, normal=1000.0)
+        ps = self._ps(); ps.start([100.0, 250.0, 500.0, 750.0], 1000.0)
+        ps.level = 2
+        ps.record_result(True, balance=6000.0)
+        ps.record_result(True, balance=6000.0)   # gate met AND balance clears
+        assert ps.current_size() == 750.0
+        assert ps.level == 3
+
+    def test_graduation_to_full_size_balance_gated(self, monkeypatch):
+        # Top rung $750 proven, but graduating to the full $1000 needs ≥ $5000.
+        self._no_telegram(monkeypatch)
+        self._cfg(monkeypatch, streak=2, normal=1000.0)
+        ps = self._ps(); ps.start([100.0, 250.0, 500.0, 750.0], 1000.0)
+        ps.level = 3                              # at $750 (already unlocked)
+        ps.record_result(True, balance=4000.0)
+        ps.record_result(True, balance=4000.0)   # gate met, graduation gated
+        assert ps.active is True
+        assert ps.current_size() == 750.0
+        # Once equity clears, the same proven edge graduates to full $1000.
+        ps.record_result(True, balance=6000.0)
+        assert ps.active is False
+        assert ps.current_size() == 1000.0
+
+    def test_low_rung_advance_never_gated(self, monkeypatch):
+        # Climbing $100 → $250 (both ≤ $500) is never balance-gated.
+        self._no_telegram(monkeypatch)
+        self._cfg(monkeypatch, streak=2, normal=1000.0)
+        ps = self._ps(); ps.start([100.0, 250.0, 500.0, 750.0], 1000.0)
+        ps.record_result(True, balance=100.0)
+        ps.record_result(True, balance=100.0)
+        assert ps.current_size() == 250.0         # advanced despite tiny balance
+
+    def test_balance_none_preserves_legacy_advance(self, monkeypatch):
+        # No balance in scope (legacy/unit path) must not block advancement.
+        self._no_telegram(monkeypatch)
+        self._cfg(monkeypatch, streak=2, normal=1000.0)
+        ps = self._ps(); ps.start([100.0, 250.0, 500.0, 750.0], 1000.0)
+        ps.level = 2
+        ps.record_result(True)                    # balance defaults None
+        ps.record_result(True)
+        assert ps.current_size() == 750.0
+
+
+class TestProbationRungLadder:
+    """v9.8.0: _probation_rungs() builds a fixed-step ladder up to NORMAL."""
+
+    def test_ladder_to_1000(self, monkeypatch):
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
+        monkeypatch.setattr(bot, "PROBATION_RUNG_STEP", 250.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 1000.0)
+        assert bot._probation_rungs() == [100.0, 250.0, 500.0, 750.0]
+
+    def test_ladder_to_500_unchanged(self, monkeypatch):
+        # Backward compatible with v9.7.0 (NORMAL=$500 → [100, 250]).
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
+        monkeypatch.setattr(bot, "PROBATION_RUNG_STEP", 250.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        assert bot._probation_rungs() == [100.0, 250.0]
+
+    def test_explicit_override_still_honored(self, monkeypatch):
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "100,250,500,750")
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 1000.0)
+        assert bot._probation_rungs() == [100.0, 250.0, 500.0, 750.0]
+
+
+class TestHighStakeBalanceGate:
+    """v9.8.0: active_trade_size(balance) caps stakes above the gate size while
+    equity is below the high-stake minimum balance."""
+
+    def setup_method(self):
+        bot.recovery.active = False
+        bot.probation.active = False
+
+    def teardown_method(self):
+        bot.recovery.active = False
+        bot.probation.active = False
+
+    def _cfg(self, monkeypatch, normal=1000.0, gate=500.0, min_bal=5000.0):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", normal)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "HIGH_STAKE_GATE_SIZE", gate)
+        monkeypatch.setattr(bot, "HIGH_STAKE_MIN_BALANCE", min_bal)
+
+    def test_normal_capped_below_min_balance(self, monkeypatch):
+        self._cfg(monkeypatch)
+        assert bot.active_trade_size(4000.0) == 500.0     # $1000 → capped to $500
+        assert bot.active_trade_size(6000.0) == 1000.0    # unlocked
+
+    def test_no_balance_returns_raw_size(self, monkeypatch):
+        self._cfg(monkeypatch)
+        assert bot.active_trade_size() == 1000.0          # legacy no-arg path
+
+    def test_recovery_floor_never_gated(self, monkeypatch):
+        self._cfg(monkeypatch)
+        bot.recovery.active = True
+        assert bot.active_trade_size(100.0) == 100.0      # tiny balance, still $100
+
+    def test_probation_high_rung_capped(self, monkeypatch):
+        self._cfg(monkeypatch)
+        bot.probation.active = True
+        bot.probation.rungs = [100.0, 250.0, 500.0, 750.0]
+        bot.probation.level = 3                           # $750
+        bot.probation.full_size = 1000.0
+        assert bot.active_trade_size(4000.0) == 500.0
+        assert bot.active_trade_size(6000.0) == 750.0
+
+    def test_gate_size_itself_allowed(self, monkeypatch):
+        self._cfg(monkeypatch, normal=500.0)
+        assert bot.active_trade_size(100.0) == 500.0      # $500 == gate, allowed
 
 
 class TestActiveTradeSizeProbation:

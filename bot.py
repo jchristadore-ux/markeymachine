@@ -1,7 +1,21 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.7.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.8.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.8.0 — BALANCE-GATED $1000 CEILING: the slow-roll ramp can now climb to   ║
+║  $750 and $1000, but only once the book can absorb it.                       ║
+║                                                                              ║
+║  The daily ramp ($100 → $250 → $500) now extends to $100 → $250 → $500 →     ║
+║  $750 → $1000 (auto-built in $250 steps up to NORMAL_TRADE_SIZE; owner sets  ║
+║  the $1000 top via TRADE_SIZE_DOLLARS=1000). The top rungs are balance-gated:║
+║  stakes above HIGH_STAKE_GATE_SIZE ($500) require equity ≥ HIGH_STAKE_MIN_   ║
+║  BALANCE ($5000). Enforced twice — a hard ceiling re-checked every trade at  ║
+║  sizing time (so a balance that dips back under the line caps the next stake ║
+║  to $500) AND at ramp-advance time (high rungs are earned one at a time after║
+║  crossing $5000, never jumped into). Below $5000 the effective ceiling stays ║
+║  $500, unchanged from v9.7.0. RAILWAY: TRADE_SIZE_DOLLARS=1000,              ║
+║  HIGH_STAKE_MIN_BALANCE (5000), HIGH_STAKE_GATE_SIZE (500).                  ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.7.0 — DAILY SLOW-ROLL: re-arm the probation ramp at each new trading day.║
 ║                                                                              ║
@@ -273,7 +287,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.7.0"
+BOT_VERSION = "9.8.0"
 
 import base64
 import json
@@ -452,6 +466,24 @@ PROBATION_WINRATE_MIN_TRADES = _env_int("PROBATION_WINRATE_MIN_TRADES", 4)
 PROBATION_RUNGS_RAW          = os.environ.get("PROBATION_RUNGS", "").strip()
 PROBATION_STATE_PATH         = os.environ.get("PROBATION_STATE_PATH", "probation_state.json")
 PROBATION_PERSIST            = _env_bool("PROBATION_PERSIST", True)
+# Auto-built rungs step up in fixed dollar increments from RECOVERY_TRADE_SIZE to
+# (exclusive) NORMAL_TRADE_SIZE. With NORMAL=$1000 this yields the owner ladder
+# $100 → $250 → $500 → $750 (graduating to $1000); with NORMAL=$500 it stays
+# $100 → $250 (graduating to $500), unchanged from v9.7.0.
+PROBATION_RUNG_STEP          = _env_float("PROBATION_RUNG_STEP", 250.0)
+
+# ── High-stake balance gate (v9.8.0) ──────────────────────────────────────────
+# WHY: the ramp ceiling now reaches $1000, but a $750/$1000 stake is only prudent
+# once the book can absorb it. Stakes ABOVE HIGH_STAKE_GATE_SIZE require at least
+# HIGH_STAKE_MIN_BALANCE of equity. The gate is enforced in two places: a hard
+# ceiling re-checked on every trade at sizing time (active_trade_size → kelly_bet)
+# so a balance that drops back under the line caps the next stake to the gate
+# size; AND at ramp-advance time so a win rate banked at $500 cannot jump straight
+# to $1000 the instant balance crosses the line — the high rungs are earned one at
+# a time, mirroring the v9.6.0 "no one-jump re-arm" rule. Set HIGH_STAKE_MIN_BALANCE
+# very high (or above your max stake) to effectively pin the ceiling at the gate.
+HIGH_STAKE_GATE_SIZE         = _env_float("HIGH_STAKE_GATE_SIZE", 500.0)
+HIGH_STAKE_MIN_BALANCE       = _env_float("HIGH_STAKE_MIN_BALANCE", 5000.0)
 
 # ── Dashboard / observability ─────────────────────────────────────────────────
 # When set, the bot writes a small JSON status snapshot once per main-loop cycle
@@ -477,10 +509,15 @@ def _probation_rungs() -> "list[float]":
         if not rungs or rungs[0] > lo:
             rungs = [lo] + [r for r in rungs if r > lo]
         return rungs
+    # Fixed-step ladder: floor, then every PROBATION_RUNG_STEP up to (exclusive)
+    # full size. NORMAL=$1000 → [100, 250, 500, 750]; NORMAL=$500 → [100, 250].
     rungs = [lo]
-    mid = round(hi / 2.0, 2)
-    if lo < mid < hi:
-        rungs.append(mid)
+    step  = PROBATION_RUNG_STEP if PROBATION_RUNG_STEP > 0 else hi
+    v     = step
+    while v < hi:
+        if v > lo:
+            rungs.append(round(v, 2))
+        v += step
     return rungs
 
 # ── Risk controls ─────────────────────────────────────────────────────────────
@@ -972,15 +1009,36 @@ class ProbationState:
         return (n >= PROBATION_WINRATE_MIN_TRADES
                 and (self.wins / n) >= PROBATION_WIN_RATE_MIN)
 
-    def record_result(self, won: bool) -> None:
-        """Fold one settled probation-mode trade into the ramp."""
+    def _next_rung_allowed(self, balance: "float | None") -> bool:
+        """High-stake balance gate on advancement: the ramp may only climb into a
+        rung (or graduate into a full size) above HIGH_STAKE_GATE_SIZE once equity
+        clears HIGH_STAKE_MIN_BALANCE — so a win rate banked at $500 cannot jump to
+        $1000 the instant balance crosses the line. `balance is None` (no balance
+        in scope, e.g. unit tests) does not block, preserving legacy behavior."""
+        nxt = (self.full_size if self.level >= len(self.rungs) - 1
+               else self.rungs[self.level + 1])
+        if nxt <= HIGH_STAKE_GATE_SIZE or balance is None:
+            return True
+        return balance >= HIGH_STAKE_MIN_BALANCE
+
+    def record_result(self, won: bool, balance: "float | None" = None) -> None:
+        """Fold one settled probation-mode trade into the ramp. `balance` (the
+        equity at settlement) feeds the high-stake gate on advancement."""
         if not self.active:
             return
         if won:
             self.wins  += 1
             self.streak += 1
             if self._gate_met():
-                self._advance()
+                if self._next_rung_allowed(balance):
+                    self._advance()
+                else:
+                    # Boxes checked but equity too low for the next (high) rung —
+                    # hold and keep the streak so it climbs once balance clears.
+                    log.info("Probation ramp │ gate met but balance $%s < $%.0f — "
+                             "holding at $%.2f until the book can absorb the next rung.",
+                             f"{balance:.0f}" if balance is not None else "?",
+                             HIGH_STAKE_MIN_BALANCE, self.current_size())
         else:
             self.losses += 1
             self.streak  = 0
@@ -1198,15 +1256,32 @@ class BucketStats:
 bucket_stats = BucketStats(BUCKET_STATS_PATH, BUCKET_PERSIST)
 
 
-def active_trade_size() -> float:
+def _balance_gated_size(size: float, balance: "float | None") -> float:
+    """Cap a stake to HIGH_STAKE_GATE_SIZE while equity is below
+    HIGH_STAKE_MIN_BALANCE — the high rungs ($750/$1000) are only stakeable once
+    the book can absorb them. `balance is None` (no balance in scope, e.g. unit
+    tests) means "don't gate" so callers get the raw mode size."""
+    if balance is None:
+        return size
+    if size > HIGH_STAKE_GATE_SIZE and balance < HIGH_STAKE_MIN_BALANCE:
+        return HIGH_STAKE_GATE_SIZE
+    return size
+
+
+def active_trade_size(balance: "float | None" = None) -> float:
     """The dollar stake for the current mode. Single source of truth for sizing
     — every position-sizing path derives from this, not from a raw env var.
-    Priority: recovery (deepest claw-back) → probation ramp → normal."""
+    Priority: recovery (deepest claw-back) → probation ramp → normal. When
+    `balance` is supplied the high-stake balance gate caps the result (see
+    _balance_gated_size); the realized stake therefore re-checks equity on every
+    trade."""
     if recovery.active:
-        return RECOVERY_TRADE_SIZE
-    if probation.active:
-        return probation.current_size()
-    return NORMAL_TRADE_SIZE
+        size = RECOVERY_TRADE_SIZE
+    elif probation.active:
+        size = probation.current_size()
+    else:
+        size = NORMAL_TRADE_SIZE
+    return _balance_gated_size(size, balance)
 
 
 def in_clawback() -> bool:
@@ -1230,12 +1305,13 @@ def on_trade_settled(won: bool, trade_rec: dict, current_balance: float) -> None
         probation.cancel()
 
 
-def probation_record(won: bool, trade_rec: dict) -> None:
+def probation_record(won: bool, trade_rec: dict, current_balance: "float | None" = None) -> None:
     """Probation RAMP hook, called once per settled trade. Only probation-mode
-    trades (entered while the ramp was active) advance or step the ramp."""
+    trades (entered while the ramp was active) advance or step the ramp.
+    `current_balance` (equity at settlement) feeds the high-stake advance gate."""
     if (trade_rec or {}).get("mode_at_entry") != "probation":
         return
-    probation.record_result(bool(won))
+    probation.record_result(bool(won), current_balance)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1714,7 +1790,7 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
     # (NORMAL_TRADE_SIZE normally, RECOVERY_TRADE_SIZE while in recovery).
     if full_kelly <= 0.0:
         return 0.0
-    size     = active_trade_size()
+    size     = active_trade_size(balance)   # high-stake gate re-checks equity here
     base_bet = round(min(size, balance), 2)
 
     # Laddering overlay (opt-in). Scales the flat stake by a performance
@@ -2044,7 +2120,7 @@ def resolve_open_orders() -> None:
             # already updated above for this settlement.
             on_trade_settled(won, trade, paper_balance)
             # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
-            probation_record(won, trade)
+            probation_record(won, trade, paper_balance)
 
             log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
                      ticker[-15:], side, result.upper(), sim, paper_balance)
@@ -2170,7 +2246,7 @@ def resolve_open_orders() -> None:
             # this settled trade.
             on_trade_settled(won, trade, balance)
             # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
-            probation_record(won, trade)
+            probation_record(won, trade, balance)
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",
@@ -2487,7 +2563,7 @@ def telegram_boot(balance: float) -> None:
         f"🤖 MarkeyMachine {BOT_VERSION} STARTED\n"
         f"{mode} │ State: {session_state.value}\n"
         f"Balance: ${balance:.2f}\n"
-        f"Size=${active_trade_size():.0f} "
+        f"Size=${active_trade_size(balance):.0f} "
         f"(normal=${NORMAL_TRADE_SIZE:.0f}/recovery=${RECOVERY_TRADE_SIZE:.0f}"
         f"{' • RECOVERING→$%.0f' % recovery.target_balance if recovery.active else ''}) | "
         f"MaxConsecL={MAX_CONSEC_LOSSES}\n"
@@ -2553,7 +2629,7 @@ def write_status_snapshot(balance: float) -> None:
             "win_rate": rate_pct,
             "wilson_ci": [lo_pct, hi_pct],
             "active_mode": active_mode,
-            "active_trade_size": round(active_trade_size(), 2),
+            "active_trade_size": round(active_trade_size(balance), 2),
             "open_positions": len(open_orders),
             "open_tickers": [o.get("ticker", "") for o in open_orders.values()],
             "session_state": session_state.value,
