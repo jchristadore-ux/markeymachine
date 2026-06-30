@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MarkeyMachine{% block title %}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('index') }}">MarkeyMachine</a>
+    {% if request.endpoint != 'login' %}
+    <nav>
+      <a href="{{ url_for('index') }}">Dashboard</a>
+      <a href="{{ url_for('formats_page') }}">Formats</a>
+      <a href="{{ url_for('settings_page') }}">Settings</a>
+      <a class="muted" href="{{ url_for('logout') }}">Log out</a>
+    </nav>
+    {% endif %}
+  </header>
+
+  <main>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flashes">
+          {% for category, message in messages %}
+            <div class="flash {{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="foot muted">
+    MarkeyMachine control panel · Kalshi BTC 15-min · prediction-market trading
+    carries real risk of loss.
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

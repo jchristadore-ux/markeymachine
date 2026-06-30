@@ -1,3 +1,5 @@
 requests>=2.31.0
 cryptography>=41.0.0
+cffi>=1.15.0
+flask>=3.0.0
 pytest>=7.0.0

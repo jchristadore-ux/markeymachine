@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %} · Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+{% if running %}<div class="flash ok">Worker is running. Credential or mode changes apply on next restart.</div>{% endif %}
+
+<section class="card">
+  <h2>Account &amp; Kalshi credentials</h2>
+  <p class="muted small">The private key is stored on disk under this account's
+  directory and never shown again. The client's funds stay in their own Kalshi
+  account — this only needs a trade-scoped API key.</p>
+  <form method="post" action="{{ url_for('save_settings') }}">
+    <label>Label
+      <input type="text" name="label" value="{{ account.label }}">
+    </label>
+    <label>Kalshi API Key ID
+      <input type="text" name="kalshi_key_id" value="{{ account.kalshi_key_id }}" placeholder="UUID from Kalshi → Settings → API Keys">
+    </label>
+    <label>Kalshi Private Key (PEM){% if account.has_credentials %} <span class="muted small">— a key is set; paste a new one to replace it</span>{% endif %}
+      <textarea name="kalshi_pem" rows="6" placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;...&#10;-----END RSA PRIVATE KEY-----"></textarea>
+    </label>
+    <label>Paper starting balance ($)
+      <input type="number" step="0.01" name="paper_balance" value="{{ account.paper_balance }}">
+    </label>
+    <h3>Telegram (optional)</h3>
+    <label>Bot token
+      <input type="text" name="telegram_bot_token" placeholder="{{ 'set' if account.has_telegram else 'from @BotFather' }}">
+    </label>
+    <label>Chat ID
+      <input type="text" name="telegram_chat_id" value="{{ account.telegram_chat_id }}">
+    </label>
+    <button class="btn primary" type="submit">Save settings</button>
+  </form>
+</section>
+
+<section class="card danger-zone">
+  <h2>Trading mode</h2>
+  <p>Current mode:
+    {% if account.demo_mode %}<span class="badge paper">PAPER (demo)</span>{% else %}<span class="badge live">LIVE — real money</span>{% endif %}
+  </p>
+  {% if account.demo_mode %}
+    <form method="post" action="{{ url_for('set_mode') }}" onsubmit="return confirm('Enable LIVE real-money trading for this account?');">
+      <input type="hidden" name="mode" value="live">
+      <p class="warn">⚠️ LIVE mode places real orders with real money on the client's
+      Kalshi account. Type <code>LIVE</code> below to confirm.</p>
+      <label>Confirmation
+        <input type="text" name="confirm" placeholder="type LIVE" autocomplete="off">
+      </label>
+      <button class="btn danger" type="submit">Switch to LIVE</button>
+    </form>
+  {% else %}
+    <form method="post" action="{{ url_for('set_mode') }}">
+      <input type="hidden" name="mode" value="paper">
+      <button class="btn" type="submit">Switch back to PAPER</button>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

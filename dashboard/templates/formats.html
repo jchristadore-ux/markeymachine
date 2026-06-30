@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %} · Formats{% endblock %}
+{% block content %}
+<h1>Trading Formats</h1>
+<p class="muted">A format is a named bundle of sizing + gate settings. Selecting one
+changes the whole posture in one switch. Explicit overrides in Settings still win.
+{% if running %}<strong>Worker is running — restart it to apply a new format.</strong>{% endif %}</p>
+
+<div class="format-grid">
+  {% for f in formats %}
+  <form method="post" action="{{ url_for('select_format') }}" class="card format {{ 'active' if f.name == account.trading_format }}">
+    <input type="hidden" name="trading_format" value="{{ f.name }}">
+    <div class="row between">
+      <h2>{{ f.display_name }}</h2>
+      {% if f.name == account.trading_format %}<span class="badge ok">Selected</span>{% endif %}
+    </div>
+    <p>{{ f.blurb }}</p>
+    <details>
+      <summary>Details &amp; settings</summary>
+      <p class="small">{{ f.description }}</p>
+      <table class="kv small">
+        {% for k, v in f.settings.items() %}
+        <tr><td class="mono">{{ k }}</td><td class="mono">{{ v }}</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+    <button class="btn primary" {{ 'disabled' if f.name == account.trading_format }}>
+      {{ 'Current' if f.name == account.trading_format else 'Use this format' }}
+    </button>
+  </form>
+  {% endfor %}
+</div>
+{% endblock %}

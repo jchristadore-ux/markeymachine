@@ -1,7 +1,10 @@
 [build]
 builder = "nixpacks"
 
+# The web service runs the management dashboard, which supervises the bot worker
+# (start/stop per account from the GUI). To run the bot headless on its own
+# instead — the pre-dashboard behavior — set startCommand back to "python bot.py".
 [deploy]
-startCommand = "python bot.py"
+startCommand = "python -m dashboard.app"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
