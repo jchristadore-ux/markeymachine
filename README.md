@@ -75,16 +75,19 @@ A format only seeds **defaults** (`os.environ.setdefault`): any environment vari
 
 ## Management Dashboard
 
-A lightweight Flask control panel ([`dashboard/`](dashboard/)) to pick a Trading Format, start/stop the worker, and watch live status (balance, P&L, win rate + Wilson CI, active sizing mode, open positions) — instead of editing env vars by hand. It runs `bot.py` as an isolated worker per account, so it is **single-account today but multi-tenant-ready**: the account store is a list and every worker gets its own state directory.
+A Flask control panel ([`dashboard/`](dashboard/)) to pick a Trading Format, start/stop the worker, and watch live status (balance, P&L, win rate + Wilson CI, active sizing mode, open positions) — instead of editing env vars by hand. It runs `bot.py` as an isolated worker per account.
+
+**Multi-tenant (Phase 1, paper).** Each customer **signs up** with an email + password and is fully isolated — their own account, their own Kalshi key, their own paper bot, seeing only their own data. Served by **gunicorn** in production. Admins (`ADMIN_EMAILS`) get an overview of every account.
 
 ```bash
 pip install -r requirements.txt
-DASHBOARD_PASSWORD=yourpassword python -m dashboard.app   # http://localhost:8080
+DASHBOARD_SECRET_KEY=dev python -m dashboard.app   # http://localhost:8080  (dev)
+# production: gunicorn dashboard.app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8
 ```
 
-- **Default PAPER everywhere.** Switching an account to LIVE (real money) requires typing a confirmation in Settings.
-- Kalshi credentials are entered in the GUI; the private key is stored under the account's own directory and never echoed back. **Client funds stay in the client's own Kalshi account** — the dashboard only needs a trade-scoped API key.
-- **The existing headless bot is unchanged.** `railway.toml` still starts the trader with `python bot.py`. Run the dashboard as a **separate** Railway service pointed at its own config file [`railway.dashboard.toml`](railway.dashboard.toml) (Settings → Config-as-code → set the config-file path), which starts `python -m dashboard.app`. A UI "Custom Start Command" alone is **not** enough — Railway's config-in-code overrides it, so the bot's `railway.toml` would otherwise run on the dashboard service and crash it. Full walkthrough: [`DASHBOARD_SETUP.md`](DASHBOARD_SETUP.md). Selecting the default `balanced` format — or running with no `TRADING_FORMAT` — does not alter the bot's sizing or any trading logic.
+- **Paper only (Phase 1).** Live (real-money) trading is disabled site-wide; the LIVE path is gated behind an admin **and** an explicit `DASHBOARD_ALLOW_LIVE=true`, and `supervisor.compose_env` force-sets `DEMO_MODE=true` whenever that flag is off — so no worker can place a real order. This is intentional pending the legal/compliance and key-encryption work (Phase 2).
+- Kalshi credentials are entered in the GUI; the private key is stored under the account's own directory and never echoed back. **Customer funds stay in the customer's own Kalshi account** — the dashboard only needs a trade-scoped, revocable API key. *(Keys are stored on disk unencrypted in Phase 1 — a small-beta tradeoff to replace with encryption-at-rest before any live phase.)*
+- **The existing headless bot is unchanged.** `railway.toml` still starts the trader with `python bot.py`. Run the dashboard as a **separate** Railway service pointed at its own config file [`railway.dashboard.toml`](railway.dashboard.toml) (Settings → Config-as-code → set the config-file path), which starts gunicorn. A UI "Custom Start Command" alone is **not** enough — Railway's config-in-code overrides it. Full walkthrough: [`DASHBOARD_SETUP.md`](DASHBOARD_SETUP.md). Selecting the default `balanced` format — or running with no `TRADING_FORMAT` — does not alter the bot's sizing or any trading logic.
 
 See [`BUSINESS_PLAN.md`](BUSINESS_PLAN.md) for the managed-service model this enables.
 

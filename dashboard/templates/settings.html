@@ -6,9 +6,10 @@
 
 <section class="card">
   <h2>Account &amp; Kalshi credentials</h2>
-  <p class="muted small">The private key is stored on disk under this account's
-  directory and never shown again. The client's funds stay in their own Kalshi
-  account — this only needs a trade-scoped API key.</p>
+  <p class="muted small">Your private key is stored under your own account and
+  never shown again. <strong>Your funds stay in your own Kalshi account</strong> —
+  this only needs a trade-scoped API key, and you can revoke it from Kalshi at any
+  time.</p>
   <form method="post" action="{{ url_for('save_settings') }}">
     <label>Label
       <input type="text" name="label" value="{{ account.label }}">
@@ -33,26 +34,33 @@
   </form>
 </section>
 
-<section class="card danger-zone">
+<section class="card">
   <h2>Trading mode</h2>
-  <p>Current mode:
-    {% if account.demo_mode %}<span class="badge paper">PAPER (demo)</span>{% else %}<span class="badge live">LIVE — real money</span>{% endif %}
-  </p>
-  {% if account.demo_mode %}
-    <form method="post" action="{{ url_for('set_mode') }}" onsubmit="return confirm('Enable LIVE real-money trading for this account?');">
-      <input type="hidden" name="mode" value="live">
-      <p class="warn">⚠️ LIVE mode places real orders with real money on the client's
-      Kalshi account. Type <code>LIVE</code> below to confirm.</p>
-      <label>Confirmation
-        <input type="text" name="confirm" placeholder="type LIVE" autocomplete="off">
-      </label>
-      <button class="btn danger" type="submit">Switch to LIVE</button>
-    </form>
+  {% if not live_enabled %}
+    <p>Current mode: <span class="badge paper">PAPER (practice)</span></p>
+    <p class="muted small">This is a practice account — every trade is simulated
+    and no real money is at risk. Live (real-money) trading is not available yet;
+    it opens in a later phase.</p>
   {% else %}
-    <form method="post" action="{{ url_for('set_mode') }}">
-      <input type="hidden" name="mode" value="paper">
-      <button class="btn" type="submit">Switch back to PAPER</button>
-    </form>
+    <p>Current mode:
+      {% if account.demo_mode %}<span class="badge paper">PAPER (demo)</span>{% else %}<span class="badge live">LIVE — real money</span>{% endif %}
+    </p>
+    {% if account.demo_mode %}
+      <form method="post" action="{{ url_for('set_mode') }}" onsubmit="return confirm('Enable LIVE real-money trading?');">
+        <input type="hidden" name="mode" value="live">
+        <p class="warn">⚠️ LIVE mode places real orders with real money on your
+        Kalshi account. Type <code>LIVE</code> below to confirm.</p>
+        <label>Confirmation
+          <input type="text" name="confirm" placeholder="type LIVE" autocomplete="off">
+        </label>
+        <button class="btn danger" type="submit">Switch to LIVE</button>
+      </form>
+    {% else %}
+      <form method="post" action="{{ url_for('set_mode') }}">
+        <input type="hidden" name="mode" value="paper">
+        <button class="btn" type="submit">Switch back to PAPER</button>
+      </form>
+    {% endif %}
   {% endif %}
 </section>
 {% endblock %}
