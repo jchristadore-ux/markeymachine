@@ -175,3 +175,20 @@ def _send_raw(text: str) -> bool:
 
     log.warning("Telegram: all 3 send attempts failed.")
     return False
+
+
+def notify(token: str, chat_id: str, text: str) -> bool:
+    """Stateless one-shot Telegram send to an explicit token/chat — used by the
+    dashboard watchdog for OPERATOR alerts, independent of the bot's module-level
+    credentials. Never raises; returns True on a 200 from Telegram."""
+    token = (token or "").strip()
+    chat_id = (chat_id or "").strip()
+    if not token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=8)
+        return r.status_code == 200
+    except Exception as exc:  # pragma: no cover - network failure path
+        log.debug("Telegram notify error: %s", exc)
+        return False

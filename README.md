@@ -89,6 +89,8 @@ DASHBOARD_SECRET_KEY=dev python -m dashboard.app   # http://localhost:8080  (dev
 - Kalshi credentials are entered in the GUI; the private key is stored under the account's own directory and never echoed back. **Customer funds stay in the customer's own Kalshi account** — the dashboard only needs a trade-scoped, revocable API key. *(Keys are stored on disk unencrypted in Phase 1 — a small-beta tradeoff to replace with encryption-at-rest before any live phase.)*
 - **The existing headless bot is unchanged.** `railway.toml` still starts the trader with `python bot.py`. Run the dashboard as a **separate** Railway service pointed at its own config file [`railway.dashboard.toml`](railway.dashboard.toml) (Settings → Config-as-code → set the config-file path), which starts gunicorn. A UI "Custom Start Command" alone is **not** enough — Railway's config-in-code overrides it. Full walkthrough: [`DASHBOARD_SETUP.md`](DASHBOARD_SETUP.md). Selecting the default `balanced` format — or running with no `TRADING_FORMAT` — does not alter the bot's sizing or any trading logic.
 
+**Monitoring.** A background watchdog alerts you on Telegram in real time when a worker crashes/stalls (and can auto-restart it); a token-protected `/health` JSON and an admin log viewer (`/admin/logs`, `/admin/api/logs`) expose every worker's status and recent logs; and [`tools/railway_logs.py`](tools/railway_logs.py) can pull raw Railway logs. See [`MONITORING.md`](MONITORING.md) (note: reading these from a Claude session requires the Claude web-environment network policy to allow your dashboard/Railway hosts).
+
 See [`BUSINESS_PLAN.md`](BUSINESS_PLAN.md) for the managed-service model this enables.
 
 ---

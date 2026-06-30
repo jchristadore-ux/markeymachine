@@ -40,6 +40,16 @@ New service → **Variables**:
 > bot runs in paper regardless. Do not enable live until the legal/compliance and
 > key-encryption work (Phase 2) is done.
 
+**Monitoring (optional but recommended)** — add these too:
+- `DASHBOARD_TELEGRAM_BOT_TOKEN` + `DASHBOARD_TELEGRAM_CHAT_ID` → real-time
+  Telegram alerts when a worker crashes/stalls (auto-restart is on by default).
+- `MONITOR_TOKEN` = a long random string → enables the `/health` JSON endpoint
+  (`https://<domain>/health?token=…`) for Claude / uptime checks.
+
+See [`MONITORING.md`](MONITORING.md) for all knobs and the note that reading
+these from a Claude session requires the Claude environment's network policy to
+allow your dashboard/Railway hosts.
+
 ## 4. Domain & port
 The dashboard is served by **gunicorn** (a production web server), bound to the
 `PORT` Railway injects. Railway routes the public domain to that port for you.

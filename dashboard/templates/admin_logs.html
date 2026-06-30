@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %} · Logs{% endblock %}
+{% block content %}
+<h1>Worker logs</h1>
+<p class="muted">Last lines of each account's bot worker (stdout + stderr).</p>
+
+{% for r in rows %}
+<section class="card">
+  <div class="row between">
+    <h2>{{ r.account.label }} <span class="muted small">{{ r.owner_email }}</span></h2>
+    <span class="badge {{ 'ok' if r.state == 'healthy' else 'off' if r.state == 'stopped' else 'live' }}">{{ r.state }}</span>
+  </div>
+  {% if r.log %}
+    <pre class="logbox">{% for ln in r.log %}{{ ln }}
+{% endfor %}</pre>
+  {% else %}
+    <p class="muted small">No log yet.</p>
+  {% endif %}
+</section>
+{% endfor %}
+{% endblock %}
