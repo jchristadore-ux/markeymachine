@@ -24,6 +24,23 @@ def test_user_create_and_verify(tmp_path):
     assert us.verify("alice@example.com", "wrong") is None
 
 
+def test_user_hash_is_pbkdf2(tmp_path):
+    # pbkdf2 avoids the scrypt/maxmem container failures.
+    u = UserStore(path=str(tmp_path / "users.json")).create("a@b.com", "password1")
+    assert u.password_hash.startswith("pbkdf2:")
+
+
+def test_login_works_across_store_instances(tmp_path):
+    # Simulates two gunicorn workers: user created via one store, verified via a
+    # second store pointed at the same file. Before the reload-on-read fix this
+    # returned None → the deployed "Incorrect email or password" bug.
+    path = str(tmp_path / "users.json")
+    UserStore(path=path).create("a@b.com", "password1")
+    other_worker = UserStore(path=path)
+    assert other_worker.verify("a@b.com", "password1") is not None
+    assert other_worker.get_by_email("a@b.com") is not None
+
+
 def test_user_duplicate_email_rejected(tmp_path):
     us = UserStore(path=str(tmp_path / "users.json"))
     us.create("a@b.com", "password1")
@@ -184,6 +201,20 @@ def test_login_logout(client):
     r = client.post("/login", data={"email": "user@example.com", "password": "password1"},
                     follow_redirects=True)
     assert b"Balance" in r.data
+
+
+def test_signup_unexpected_error_is_surfaced(client, monkeypatch):
+    # A non-validation failure (e.g. unwritable data dir / hashing) must not 500;
+    # it shows a friendly message and is logged, not swallowed silently.
+    import dashboard.app as appmod
+
+    def boom(*a, **k):
+        raise OSError("disk on fire")
+    monkeypatch.setattr(appmod.users, "create", boom)
+    r = client.post("/signup", data={"email": "x@y.com", "password": "password1"},
+                    follow_redirects=True)
+    assert r.status_code == 200
+    assert b"Couldn&#39;t create your account" in r.data or b"Couldn't create your account" in r.data
 
 
 def test_users_only_see_their_own_account(client):

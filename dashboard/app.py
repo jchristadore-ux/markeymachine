@@ -13,24 +13,52 @@ to customers — pending the legal/compliance and key-encryption work in Phase 2
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import secrets
 
 from flask import (Flask, abort, flash, redirect, render_template, request,
                    session, url_for)
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from formats import list_formats, FORMATS, DEFAULT_FORMAT
-from .accounts import Account, AccountStore
+from .accounts import Account, AccountStore, data_dir
 from .supervisor import Supervisor
 from .users import UserStore
 from .watchdog import evaluate, start_watchdog
 from .telegram_bot import start_command_bot
 
+# Send app logs to stderr so they appear in Railway's deploy logs.
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("dashboard")
+
 MONITOR_TOKEN = os.environ.get("MONITOR_TOKEN", "").strip()
 WATCHDOG_STALE_SECS = int(os.environ.get("WATCHDOG_STALE_SECS", "180") or "180")
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("DASHBOARD_SECRET_KEY") or secrets.token_hex(16)
+# Behind Railway's TLS-terminating proxy: trust X-Forwarded-* so the app sees
+# the real https scheme/host (correct Secure-cookie and url_for behavior).
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+_secret = os.environ.get("DASHBOARD_SECRET_KEY")
+if not _secret:
+    log.warning("DASHBOARD_SECRET_KEY is not set — using an ephemeral key; "
+                "logins will NOT survive a restart. Set it in the service vars.")
+app.secret_key = _secret or secrets.token_hex(16)
+
+# Surface a mis-mounted/unwritable data dir early (a common cause of signup
+# failures), instead of a confusing runtime error.
+try:
+    _dd = data_dir()
+    os.makedirs(_dd, exist_ok=True)
+    _probe = os.path.join(_dd, ".write_probe")
+    with open(_probe, "w") as _f:
+        _f.write("ok")
+    os.remove(_probe)
+except OSError as _e:
+    log.error("DASHBOARD_DATA_DIR (%s) is not writable: %s — signups will fail. "
+              "Check the Railway Volume mount.", data_dir(), _e)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
@@ -93,15 +121,24 @@ def signup():
     if current_user():
         return redirect(url_for("index"))
     if request.method == "POST":
+        email = request.form.get("email", "")
         try:
-            user = users.create(request.form.get("email", ""),
-                                 request.form.get("password", ""))
+            user = users.create(email, request.form.get("password", ""))
         except ValueError as e:
+            # Expected validation problems (bad email, short password, duplicate).
             flash(str(e), "error")
-            return render_template("signup.html", email=request.form.get("email", ""))
+            return render_template("signup.html", email=email)
+        except Exception:
+            # Anything else (e.g. unwritable data dir, hashing failure) — log the
+            # real traceback to stderr (Railway deploy logs) and show a clear note.
+            log.exception("Signup failed for %r", email)
+            flash("Couldn't create your account — please try again. If it keeps "
+                  "happening, the server logs now have the details.", "error")
+            return render_template("signup.html", email=email)
         store.ensure_for_user(user.id)
         session.clear()
         session["user_id"] = user.id
+        log.info("New account created: %s", user.email)
         flash("Welcome! Add your Kalshi key in Settings to get started.", "ok")
         return redirect(url_for("index"))
     return render_template("signup.html", email="")

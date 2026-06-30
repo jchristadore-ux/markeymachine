@@ -81,15 +81,25 @@ class UserStore:
         os.replace(tmp, self.path)
 
     # ── lookups ───────────────────────────────────────────────────────────────
+    # Reads reload from disk first so a user created by a different gunicorn
+    # worker/instance (or after this object was constructed) is always found —
+    # otherwise a fresh signup is invisible to the login request and the user
+    # sees "Incorrect email or password".
     def all(self) -> List[User]:
-        return list(self._users)
+        with _LOCK:
+            self.load()
+            return list(self._users)
 
     def get(self, user_id: str) -> Optional[User]:
-        return next((u for u in self._users if u.id == user_id), None)
+        with _LOCK:
+            self.load()
+            return next((u for u in self._users if u.id == user_id), None)
 
     def get_by_email(self, email: str) -> Optional[User]:
         e = (email or "").strip().lower()
-        return next((u for u in self._users if u.email == e), None)
+        with _LOCK:
+            self.load()
+            return next((u for u in self._users if u.email == e), None)
 
     # ── mutations ─────────────────────────────────────────────────────────────
     def create(self, email: str, password: str) -> User:
@@ -107,7 +117,9 @@ class UserStore:
                 raise ValueError("An account with that email already exists.")
             user = User(
                 email=e,
-                password_hash=generate_password_hash(password),
+                # pbkdf2 is universally supported; werkzeug's default (scrypt)
+                # fails on some containers (hashlib.scrypt maxmem limits).
+                password_hash=generate_password_hash(password, method="pbkdf2:sha256"),
                 is_admin=(e in _admin_emails()),
                 created_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             )
