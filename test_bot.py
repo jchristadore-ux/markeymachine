@@ -613,6 +613,19 @@ class TestSessionDayRollover:
         bot.consecutive_losses = 2
         bot.session_state     = SessionState.RECOVERY
         bot.session_traded_tickers.add("KXBTC15M-OLD")
+        bot.recovery.active = False
+        bot.probation.cancel()
+
+    def teardown_method(self):
+        bot.recovery.active = False
+        bot.probation.cancel()
+
+    def _enable_ramp(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+        monkeypatch.setattr(bot, "PROBATION_RAMP_ENABLED", True)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
 
     def test_same_day_is_noop(self, monkeypatch):
         monkeypatch.setattr(bot, "_session_day",
@@ -631,6 +644,36 @@ class TestSessionDayRollover:
         assert bot.consecutive_losses == 0
         assert bot.session_state == SessionState.ACTIVE
         assert "KXBTC15M-OLD" not in bot.session_traded_tickers
+
+    def test_new_day_rearms_slow_roll_ramp_from_floor(self, monkeypatch):
+        # v9.7.0: a fresh day re-enters the $100 → $250 → $500 ramp at the floor
+        # so the first trade of the day is small, not full size.
+        self._enable_ramp(monkeypatch)
+        assert bot.maybe_roll_session_day(1850.0) is True
+        assert bot.probation.active is True
+        assert bot.probation.current_size() == bot.RECOVERY_TRADE_SIZE   # $100
+
+    def test_new_day_resets_halfclimbed_ramp(self, monkeypatch):
+        # A ramp left at a higher rung yesterday drops back to the floor today.
+        self._enable_ramp(monkeypatch)
+        bot.probation.start([100.0, 250.0], 500.0)
+        bot.probation.record_result(True); bot.probation.record_result(True)
+        assert bot.probation.current_size() == 250.0                    # climbed
+        assert bot.maybe_roll_session_day(1850.0) is True
+        assert bot.probation.current_size() == 100.0                    # reset
+
+    def test_new_day_skips_rearm_during_recovery(self, monkeypatch):
+        # Recovery is the deeper claw-back tier and must take priority.
+        self._enable_ramp(monkeypatch)
+        bot.recovery.active = True
+        assert bot.maybe_roll_session_day(1850.0) is True
+        assert bot.probation.active is False
+
+    def test_new_day_no_ramp_when_disabled(self, monkeypatch):
+        self._enable_ramp(monkeypatch)
+        monkeypatch.setattr(bot, "PROBATION_RAMP_ENABLED", False)
+        assert bot.maybe_roll_session_day(1850.0) is True
+        assert bot.probation.active is False                            # stays $500
 
 
 class TestWilsonCI:
@@ -1547,6 +1590,49 @@ class TestProbationState:
         assert ps2.active is True
         assert ps2.current_size() == 250.0
         assert ps2.level == 1
+
+    def test_start_records_arm_day(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        ps = self._ps(); ps.start([100.0, 250.0], 500.0)
+        today = bot.datetime.now(bot.timezone.utc).strftime("%Y-%m-%d")
+        assert ps.day == today
+
+    def test_reconcile_new_day_rearms_to_floor(self, monkeypatch):
+        # v9.7.0: a restart crossing midnight re-arms the ramp from the floor.
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
+        bot.recovery.active = False
+        ps = self._ps()
+        ps.active = True; ps.rungs = [100.0, 250.0]; ps.full_size = 500.0
+        ps.level = 1; ps.day = "2000-01-01"        # stale → new day
+        ps.reconcile_on_boot()
+        assert ps.active is True
+        assert ps.level == 0
+        assert ps.current_size() == 100.0
+        assert ps.day == bot.datetime.now(bot.timezone.utc).strftime("%Y-%m-%d")
+
+    def test_reconcile_same_day_resumes_progress(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        bot.recovery.active = False
+        today = bot.datetime.now(bot.timezone.utc).strftime("%Y-%m-%d")
+        ps = self._ps()
+        ps.active = True; ps.rungs = [100.0, 250.0]; ps.full_size = 500.0
+        ps.level = 1; ps.day = today               # same day → no reset
+        ps.reconcile_on_boot()
+        assert ps.level == 1
+        assert ps.current_size() == 250.0
+
+    def test_reconcile_new_day_skipped_in_recovery(self, monkeypatch):
+        self._no_telegram(monkeypatch); self._cfg(monkeypatch)
+        bot.recovery.active = True
+        try:
+            ps = self._ps()
+            ps.active = True; ps.rungs = [100.0, 250.0]; ps.full_size = 500.0
+            ps.level = 1; ps.day = "2000-01-01"
+            ps.reconcile_on_boot()
+            assert ps.level == 1                   # recovery deeper → ramp untouched
+        finally:
+            bot.recovery.active = False
 
 
 class TestActiveTradeSizeProbation:

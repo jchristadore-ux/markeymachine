@@ -1,7 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.6.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.7.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.7.0 — DAILY SLOW-ROLL: re-arm the probation ramp at each new trading day.║
+║                                                                              ║
+║  The $100 → $250 → $500 ramp existed but only ever fired AFTER a recovery    ║
+║  exit, so on an ordinary day the bot opened cold at full $500 (2026-06-30:   ║
+║  first trade $499.80). Owner intent is for the FIRST trade of every day to   ║
+║  start small and scale up. FIX: the UTC daily rollover now re-arms the ramp  ║
+║  from the floor (skipped while RECOVERY is active, which is the deeper tier), ║
+║  and a restart that crosses midnight re-arms on boot via a persisted arm-    ║
+║  date. The advance gate is unchanged (2-win streak OR ≥60% win rate; step    ║
+║  down on a loss). Disable with PROBATION_RAMP_ENABLED=false (every day stays ║
+║  full size, as before).                                                      ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.6.0 — PROBATION RAMP: graduated re-entry after recovery (log-review fix).║
 ║                                                                              ║
@@ -261,7 +273,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.6.0"
+BOT_VERSION = "9.7.0"
 
 import base64
 import json
@@ -906,16 +918,20 @@ class ProbationState:
         self.streak:    int         = 0      # consecutive wins at the current rung
         self.wins:      int         = 0      # cumulative settled wins this ramp
         self.losses:    int         = 0      # cumulative settled losses this ramp
+        self.day:       str         = ""     # UTC date (YYYY-MM-DD) the ramp was armed
         self._path    = path
         self._persist = persist
         if self._persist:
             self._load()
 
     # ── transitions ──────────────────────────────────────────────────────────
-    def start(self, rungs: List[float], full_size: float) -> bool:
+    def start(self, rungs: List[float], full_size: float,
+              reason: str = "Re-entering after recovery") -> bool:
         """Begin a ramp from rungs[0] up toward full_size. No-op (returns False)
         when the ramp is disabled or there is no sub-full room to climb — the
-        caller then resumes full size directly, exactly as before."""
+        caller then resumes full size directly, exactly as before. `reason` is a
+        short human label for the log/Telegram copy so the post-recovery and the
+        daily-warm-up triggers read differently."""
         if not PROBATION_RAMP_ENABLED:
             return False
         rungs = [round(float(r), 2) for r in rungs if r < full_size]
@@ -928,13 +944,14 @@ class ProbationState:
         self.streak    = 0
         self.wins      = 0
         self.losses    = 0
+        self.day       = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._save()
-        log.warning("Probation ramp START │ base $%.2f → full $%.2f via %s",
-                    self.rungs[0], self.full_size,
+        log.warning("Probation ramp START (%s) │ base $%.2f → full $%.2f via %s",
+                    reason, self.rungs[0], self.full_size,
                     " → ".join(f"${r:.0f}" for r in self.rungs + [self.full_size]))
         tg.send_telegram_message(
             f"🪜 PROBATION RAMP STARTED\n"
-            f"Re-entering at ${self.rungs[0]:.2f}; will climb "
+            f"{reason}: re-entering at ${self.rungs[0]:.2f}; will climb "
             f"{' → '.join(f'${r:.0f}' for r in self.rungs + [self.full_size])} "
             f"as the edge re-proves itself.\n"
             f"Advance on {PROBATION_WIN_STREAK}-win streak or "
@@ -1018,6 +1035,7 @@ class ProbationState:
         self.level  = 0
         self.rungs  = []
         self.streak = self.wins = self.losses = 0
+        self.day    = ""
         self._save()
 
     def reconcile_on_boot(self) -> None:
@@ -1026,6 +1044,16 @@ class ProbationState:
         if not self.rungs or self.full_size <= 0.0:
             log.warning("Probation boot │ corrupt ramp — clearing.")
             self.cancel()
+            return
+        # A restart that crosses a UTC day boundary must re-arm the daily slow-roll
+        # from the floor (matching the live midnight rollover), not resume
+        # yesterday's progress. Recovery is the deeper claw-back and takes
+        # priority, so leave its ramp alone. Same-day restarts resume unchanged.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.day and self.day != today and not recovery.active:
+            log.info("Probation boot │ new day (%s→%s) — re-arming ramp from floor.",
+                     self.day, today)
+            self.start(_probation_rungs(), NORMAL_TRADE_SIZE, reason="Daily slow-roll")
             return
         self.level = max(0, min(self.level, len(self.rungs) - 1))
         log.info("Probation boot │ RESUMING ramp at base $%.2f (rung %d/%d).",
@@ -1054,6 +1082,7 @@ class ProbationState:
                     "streak":    self.streak,
                     "wins":      self.wins,
                     "losses":    self.losses,
+                    "day":       self.day,
                 }, f)
             os.replace(tmp, self._path)   # atomic on POSIX
         except OSError as e:
@@ -1072,6 +1101,7 @@ class ProbationState:
         self.streak    = int(d.get("streak", 0))
         self.wins      = int(d.get("wins", 0))
         self.losses    = int(d.get("losses", 0))
+        self.day       = str(d.get("day", "") or "")
 
 
 probation = ProbationState(PROBATION_STATE_PATH, PROBATION_PERSIST)
@@ -2759,6 +2789,16 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     streak_pause_until     = 0.0
     session_state          = SessionState.ACTIVE
     session_traded_tickers.clear()
+
+    # v9.7.0: a fresh trading day re-enters the slow-roll ramp from the floor
+    # ($100 → $250 → $500) so the first trade of the day is small and scales up
+    # only as the edge re-proves itself, rather than firing full size cold.
+    # Recovery is the deeper claw-back tier and takes priority — never override
+    # it. start() is a safe no-op when the ramp is disabled or there is no
+    # sub-full room (sizing then stays normal), and it resets any half-climbed
+    # ramp left over from yesterday back to the floor.
+    if not recovery.active:
+        probation.start(_probation_rungs(), NORMAL_TRADE_SIZE, reason="Daily slow-roll")
 
     log.info("🔄 New trading day %s │ balance $%.2f │ daily budget reset%s",
              today, current_balance, " (halt cleared)" if was_halted else "")
