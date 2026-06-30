@@ -79,6 +79,31 @@ Then, in a session: `python tools/railway_logs.py --lines 100`.
 
 ---
 
+## 5. Telegram control commands
+
+The **same operator bot** (`DASHBOARD_TELEGRAM_BOT_TOKEN` /
+`DASHBOARD_TELEGRAM_CHAT_ID`) that posts alerts also accepts commands. Only the
+authorized chat id(s) are obeyed; anything else is ignored. Read commands run
+immediately; any command that **changes** something requires a `/confirm`.
+
+| Command | Action |
+|---|---|
+| `/status [acct]` | worker health + balance/PnL per account |
+| `/logs [acct] [n]` | recent worker log lines |
+| `/analyze [acct]` | rule-based diagnosis (win rate, errors, stalls, drawdown) + a recommended command |
+| `/format <name> [acct]` | switch Trading Format — **needs `/confirm`** |
+| `/set <PARAM> <value> [acct]` | override a tunable parameter — **needs `/confirm`** |
+| `/pause` · `/resume` · `/restart` `[acct]` | control the worker — **needs `/confirm`** |
+| `/confirm` · `/cancel` | apply / discard the staged change |
+| `/formats` · `/help` | list formats / commands |
+
+It only ever changes the **safe, structured levers** — Trading Format and the
+allowlisted parameters in `formats.ALLOWED_PARAM_KEYS` — never algorithm code,
+and never the paper-mode safety. Disable the listener with
+`DASHBOARD_TELEGRAM_COMMANDS=false`.
+
+---
+
 ## Reaching these from Claude — network policy ⚠️
 
 For Claude to read `/health`, `/admin/api/logs`, or run `tools/railway_logs.py`,

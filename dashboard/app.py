@@ -24,6 +24,7 @@ from .accounts import Account, AccountStore
 from .supervisor import Supervisor
 from .users import UserStore
 from .watchdog import evaluate, start_watchdog
+from .telegram_bot import start_command_bot
 
 MONITOR_TOKEN = os.environ.get("MONITOR_TOKEN", "").strip()
 WATCHDOG_STALE_SECS = int(os.environ.get("WATCHDOG_STALE_SECS", "180") or "180")
@@ -341,9 +342,12 @@ def admin_api_logs():
     return {"account": acct.id, "lines": supervisor.tail_log(acct, lines)}
 
 
-# Start the background watchdog when the app module is imported (gunicorn worker
-# or `python -m dashboard.app`). Idempotent; disabled with DASHBOARD_WATCHDOG=false.
+# Start background services when the app module is imported (gunicorn worker or
+# `python -m dashboard.app`). Both are idempotent singletons and no-op unless
+# configured: the watchdog (DASHBOARD_WATCHDOG) and the operator Telegram command
+# listener (needs DASHBOARD_TELEGRAM_BOT_TOKEN + DASHBOARD_TELEGRAM_CHAT_ID).
 start_watchdog(supervisor, store)
+start_command_bot(supervisor, store)
 
 
 def main():

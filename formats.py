@@ -190,6 +190,51 @@ FORMATS: Dict[str, dict] = {
 }
 
 
+# Trading parameters that may be overridden per account (e.g. via the Telegram
+# /set command). Curated allowlist: tunable strategy knobs only — never
+# DEMO_MODE (paper safety), credentials, or state-file paths. Each maps to a
+# coercion so values are validated before they reach a worker's env.
+ALLOWED_PARAM_KEYS = {
+    "NORMAL_TRADE_SIZE": float,
+    "RECOVERY_TRADE_SIZE": float,
+    "OB_IMBALANCE_THRESH": float,
+    "MIN_OB_DEPTH_DOLLARS": float,
+    "R2_TREND_THRESHOLD": float,
+    "MOMENTUM_THRESH_PCT": float,
+    "MIN_EDGE_PCT": float,
+    "MIN_WIN_PROB": float,
+    "MIN_CONFIDENCE": int,
+    "MAX_CONCURRENT_POS": int,
+    "MAX_CONSEC_LOSSES": int,
+    "SESSION_STOP_FRACTION": float,
+    "YES_BREAKEVEN_PRICE": int,
+    "POLL_INTERVAL_SECS": int,
+    "LADDER_ENABLED": "bool",
+    "PROBATION_RAMP_ENABLED": "bool",
+    "REQUIRE_AGREE_MOMENTUM": "bool",
+}
+
+
+def coerce_param(key: str, value: str) -> str:
+    """Validate a /set override. Returns the normalized string to store in env.
+    Raises ValueError on an unknown key or unparseable value."""
+    key = (key or "").strip().upper()
+    if key not in ALLOWED_PARAM_KEYS:
+        raise ValueError(
+            f"'{key}' is not an adjustable parameter. Allowed: "
+            + ", ".join(sorted(ALLOWED_PARAM_KEYS)))
+    kind = ALLOWED_PARAM_KEYS[key]
+    raw = (value or "").strip()
+    if kind == "bool":
+        if raw.lower() not in ("true", "false", "1", "0", "yes", "no"):
+            raise ValueError(f"{key} must be true/false.")
+        return "true" if raw.lower() in ("true", "1", "yes") else "false"
+    try:
+        return str(kind(raw))  # float(...) / int(...)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a {kind.__name__}.")
+
+
 def _resolve(name: str) -> str:
     """Normalize a requested format name to a known key, or DEFAULT_FORMAT."""
     key = (name or "").strip().lower().replace("-", "_").replace(" ", "_")

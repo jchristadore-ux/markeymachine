@@ -61,6 +61,17 @@ def compose_env(account: Account) -> Dict[str, str]:
     if account.telegram_bot_token and account.telegram_chat_id:
         env["TELEGRAM_BOT_TOKEN"] = account.telegram_bot_token
         env["TELEGRAM_CHAT_ID"] = account.telegram_chat_id
+
+    # Per-account trading-parameter overrides (Telegram /set). Only allowlisted
+    # keys are honored, and never DEMO_MODE/creds — those are set above and the
+    # allowlist excludes them, so a bad override can't weaken the paper safety.
+    try:
+        from formats import ALLOWED_PARAM_KEYS
+        for key, value in (account.overrides or {}).items():
+            if key in ALLOWED_PARAM_KEYS:
+                env[key] = str(value)
+    except Exception:  # pragma: no cover - overrides must never break a launch
+        pass
     return env
 
 
