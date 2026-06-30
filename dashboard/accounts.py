@@ -44,6 +44,9 @@ class Account:
     # Path to the PEM file on disk (content lives in the account dir, not here).
     kalshi_pem_path: str = ""
     trading_format: str = "balanced"
+    # Per-account trading-parameter overrides (set via the Telegram /set command).
+    # Keys are restricted to formats.ALLOWED_PARAM_KEYS; applied in compose_env.
+    overrides: dict = field(default_factory=dict)
     demo_mode: bool = True  # default PAPER — going live is an explicit opt-in
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
