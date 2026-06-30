@@ -87,20 +87,27 @@ FORMATS: Dict[str, dict] = {
         },
     },
     "balanced": {
-        "display_name": "Balanced — Standard (v9.6 defaults)",
-        "blurb": "The shipped production posture. Two-tier Recovery + Probation "
-                 "sizing, ladder off, gates at doctrine defaults.",
+        "display_name": "Balanced — Standard (current defaults)",
+        "blurb": "The shipped production posture, unchanged. Two-tier Recovery + "
+                 "Probation sizing, ladder off, gates at doctrine defaults — and "
+                 "it does NOT touch your trade sizing.",
         "description": (
-            "The current v9.6 production configuration: $500 normal / $100 "
-            "recovery sizing with the Probation ramp on and the Ladder overlay "
-            "off, momentum-AGREE required, and the doctrine entry thresholds "
-            "(OB imbalance 0.70, R² 0.65, confidence 65, edge 6%, win-prob 60%). "
-            "A sensible middle ground."
+            "The current v9.6 production configuration, preserved exactly. Every "
+            "value below equals the bot's existing default, so selecting "
+            "'balanced' (or running with no format set) behaves identically to "
+            "the bot before Trading Formats existed. Crucially it sets NO trade "
+            "size — sizing stays governed by your own NORMAL_TRADE_SIZE / "
+            "TRADE_SIZE_DOLLARS env vars exactly as today. The Probation ramp is "
+            "on, the Ladder overlay is off, momentum-AGREE is required, and the "
+            "doctrine entry thresholds apply (OB imbalance 0.70, R² 0.65, "
+            "confidence 65, edge 6%, win-prob 60%)."
         ),
+        # NOTE: deliberately omits NORMAL_TRADE_SIZE / RECOVERY_TRADE_SIZE so the
+        # default format is a guaranteed no-op on the existing bot's sizing.
+        # Every key here already equals the code default, so seeding it via
+        # setdefault changes nothing — it only documents the posture.
         "settings": {
             "DEMO_MODE": "true",
-            "NORMAL_TRADE_SIZE": 500.0,
-            "RECOVERY_TRADE_SIZE": 100.0,
             "LADDER_ENABLED": "false",
             "PROBATION_RAMP_ENABLED": "true",
             "REQUIRE_AGREE_MOMENTUM": "true",
@@ -233,8 +240,9 @@ def print_formats() -> None:
         print(f"      {spec['display_name']}")
         print(f"      {spec['blurb']}")
         size = spec["settings"].get("NORMAL_TRADE_SIZE")
+        size_str = f"${size}" if size is not None else "operator-set (unchanged)"
         ladder = spec["settings"].get("LADDER_ENABLED")
-        print(f"      base=${size} ladder={ladder} "
+        print(f"      base={size_str} ladder={ladder} "
               f"OB≥{spec['settings'].get('OB_IMBALANCE_THRESH')} "
               f"R²≥{spec['settings'].get('R2_TREND_THRESHOLD')}\n")
     print("Select with:  TRADING_FORMAT=<name> python bot.py")

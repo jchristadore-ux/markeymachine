@@ -80,7 +80,7 @@ DASHBOARD_PASSWORD=yourpassword python -m dashboard.app   # http://localhost:808
 
 - **Default PAPER everywhere.** Switching an account to LIVE (real money) requires typing a confirmation in Settings.
 - Kalshi credentials are entered in the GUI; the private key is stored under the account's own directory and never echoed back. **Client funds stay in the client's own Kalshi account** — the dashboard only needs a trade-scoped API key.
-- On Railway the web service now runs the dashboard (see `railway.toml`); set `startCommand` back to `python bot.py` to run headless.
+- **The existing headless bot is unchanged.** `railway.toml` still starts the trader with `python bot.py`. Run the dashboard as a **separate** Railway service whose start command (set in the Railway UI) is `python -m dashboard.app`. Selecting the default `balanced` format — or running with no `TRADING_FORMAT` at all — does not alter the bot's sizing or any trading logic.
 
 See [`BUSINESS_PLAN.md`](BUSINESS_PLAN.md) for the managed-service model this enables.
 
