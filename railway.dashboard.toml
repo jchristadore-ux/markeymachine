@@ -10,10 +10,14 @@
 #
 # The bot service keeps using the default railway.toml. Nothing here touches the
 # trader.
+# Production WSGI server (gunicorn), bound to the port Railway injects ($PORT,
+# falling back to 8080). A single worker keeps the in-process supervisor/account
+# state coherent; threads handle concurrent browser requests. Railway routes the
+# public domain to this port automatically.
 [build]
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python -m dashboard.app"
+startCommand = "gunicorn dashboard.app:app --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 --timeout 120"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10

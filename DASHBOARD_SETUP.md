@@ -29,13 +29,28 @@ New service → **Variables**:
   redeploys.
 
 ## 4. Domain & port
+The dashboard is served by **gunicorn** (a production web server), bound to the
+`PORT` Railway injects. Railway routes the public domain to that port for you.
+
 - New service → **Settings → Networking → Generate Domain**.
-- **You do not put a port in the URL.** The app listens on the `PORT` Railway
-  injects automatically, and the domain maps to it. If the Generate-Domain
-  dialog asks which port to expose, use the one Railway has detected (it appears
-  once the app is running); if nothing is detected yet, type `8080`.
-- If the page doesn't load, it's almost always because the service isn't running
-  (check the Deploy logs) — fix the start command (step 2) and redeploy.
+- **You do not put a port in the URL.** Open `https://<your-domain>` directly.
+- If the Generate-Domain dialog asks which **target port** to expose, enter
+  `8080` (the dashboard's fallback when `PORT` isn't set) — or, if you set a
+  `PORT` variable yourself, use that value.
+
+### "Application failed to respond"
+This means the container is up but the domain isn't reaching the web port. Fix:
+1. Open the dashboard service's **Deploy logs**. You should see a line like
+   `Listening at: http://0.0.0.0:8080` (or another number). If instead you see
+   the bot's banner or a `KALSHI_API_KEY_ID` error, the config file from step 2
+   isn't applied — recheck **Settings → Config-as-code = `railway.dashboard.toml`**
+   and redeploy.
+2. If gunicorn is listening but the page still fails: **Settings → Networking**,
+   delete the existing domain, then **Generate Domain** again so Railway
+   re-detects the live port. (A domain generated while the service was crashing
+   can keep a stale target port.)
+3. As a deterministic option, add a **Variable** `PORT` = `8080`, set the
+   domain's target port to `8080`, and redeploy.
 
 ## 5. Use it
 1. Open the domain → log in with `DASHBOARD_PASSWORD`.
