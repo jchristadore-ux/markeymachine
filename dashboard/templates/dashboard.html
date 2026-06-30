@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %} · Dashboard{% endblock %}
+{% block content %}
+
+{% if not password_set %}
+  <div class="flash error">No DASHBOARD_PASSWORD set — this panel is unauthenticated. Set one before exposing it.</div>
+{% endif %}
+
+<div class="row between">
+  <div>
+    <h1>{{ account.label }}</h1>
+    <p class="muted">Account <code>{{ account.id }}</code></p>
+  </div>
+  <div class="badges">
+    {% if status.running %}
+      <span class="badge ok">● Worker running</span>
+    {% else %}
+      <span class="badge off">● Stopped</span>
+    {% endif %}
+    {% if account.demo_mode %}
+      <span class="badge paper">PAPER</span>
+    {% else %}
+      <span class="badge live">LIVE — real money</span>
+    {% endif %}
+  </div>
+</div>
+
+{% if not account.has_credentials %}
+  <div class="flash error">No Kalshi credentials yet. Add them in
+    <a href="{{ url_for('settings_page') }}">Settings</a> before starting.</div>
+{% endif %}
+
+<div class="controls">
+  <form method="post" action="{{ url_for('control', action='start') }}">
+    <button class="btn primary" {{ 'disabled' if status.running or not account.has_credentials }}>Start</button>
+  </form>
+  <form method="post" action="{{ url_for('control', action='stop') }}">
+    <button class="btn" {{ 'disabled' if not status.running }}>Stop</button>
+  </form>
+  <form method="post" action="{{ url_for('control', action='restart') }}">
+    <button class="btn" {{ 'disabled' if not account.has_credentials }}>Restart</button>
+  </form>
+</div>
+
+<section class="cards" id="status-cards">
+  {% set s = status.snapshot %}
+  <div class="card stat">
+    <div class="stat-label">Balance</div>
+    <div class="stat-value" data-k="balance">{{ '$%.2f'|format(s.balance) if s else '—' }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Session P&amp;L</div>
+    <div class="stat-value" data-k="session_pnl">{{ '$%+.2f'|format(s.session_pnl) if s else '—' }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Win rate</div>
+    <div class="stat-value" data-k="win_rate">
+      {% if s and (s.wins + s.losses) > 0 %}{{ s.win_rate }}% <span class="muted small">[{{ s.wilson_ci[0] }}–{{ s.wilson_ci[1] }}%]</span>{% else %}—{% endif %}
+    </div>
+    <div class="stat-sub muted">{{ s.wins if s else 0 }}W / {{ s.losses if s else 0 }}L</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Sizing mode</div>
+    <div class="stat-value" data-k="active_mode">{{ s.active_mode if s else '—' }}</div>
+    <div class="stat-sub muted">stake ${{ s.active_trade_size if s else '—' }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Open positions</div>
+    <div class="stat-value" data-k="open_positions">{{ s.open_positions if s else 0 }}</div>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Format</div>
+    <div class="stat-value">{{ account.trading_format }}</div>
+    <div class="stat-sub muted">{{ format_spec.display_name }}</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Latest signal</h2>
+  <p class="mono" data-k="last_signal">{{ s.last_signal if s else 'No data yet — start the worker.' }}</p>
+  {% if s %}
+    <p class="muted small">v{{ s.version }} · {{ s.session_state }} · updated {{ s.updated_at }}</p>
+  {% endif %}
+</section>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function refresh() {
+  try {
+    const r = await fetch("{{ url_for('api_status') }}");
+    const data = await r.json();
+    const s = data.snapshot;
+    if (!s) return;
+    const fmt = {
+      balance: v => "$" + v.toFixed(2),
+      session_pnl: v => (v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(2),
+      win_rate: v => (s.wins + s.losses) > 0 ? v + "%  [" + s.wilson_ci[0] + "–" + s.wilson_ci[1] + "%]" : "—",
+      active_mode: v => v,
+      open_positions: v => v,
+      last_signal: v => v,
+    };
+    for (const k in fmt) {
+      const el = document.querySelector(`[data-k="${k}"]`);
+      if (el && s[k] !== undefined) el.textContent = fmt[k](s[k]);
+    }
+  } catch (e) { /* ignore transient */ }
+}
+setInterval(refresh, 5000);
+</script>
+{% endblock %}

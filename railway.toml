@@ -1,6 +1,9 @@
 [build]
 builder = "nixpacks"
 
+# The existing bot service runs the trader headless, exactly as before.
+# The management dashboard is meant to run as a SEPARATE Railway service whose
+# start command is set (in the Railway UI) to:  python -m dashboard.app
 [deploy]
 startCommand = "python bot.py"
 restartPolicyType = "on_failure"

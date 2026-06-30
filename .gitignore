@@ -30,6 +30,13 @@ probation_state.json
 probation_state.json.tmp
 bucket_stats.json
 bucket_stats.json.tmp
+status.json
+status.json.tmp
+
+# Dashboard runtime state & secrets (accounts, per-client state, PEM keys, pidfiles)
+dashboard_data/
+*.pid
+*.pem
 
 # OS
 .DS_Store

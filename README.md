@@ -48,6 +48,44 @@ A performance-driven overlay on the Kelly stake that scales trade size by a mult
 
 ---
 
+## Trading Formats
+
+The bot runs **one strategy** (trend-confirming order-book pressure); what changes between deployments is the *posture* — sizing, gate strictness, and which overlays (Ladder, Recovery, Probation) are on. A **Trading Format** bundles all of those settings under one name so the whole posture switches with a single knob. Pick one with the `TRADING_FORMAT` env var (or the dashboard dropdown):
+
+```bash
+TRADING_FORMAT=conservative python bot.py
+python bot.py --list-formats        # show all formats and their settings
+python formats.py                   # same listing, no credentials needed
+```
+
+| Format | Intent |
+|---|---|
+| `conservative` | **Capital preservation.** Strict gates, recovery + probation on, ladder off, smaller stake, earlier session-stop. Fewest, highest-conviction trades. |
+| `balanced` *(default)* | The shipped v9.6 production posture: two-tier Recovery + Probation sizing, ladder off, doctrine entry thresholds. |
+| `aggressive` | **Edge hunter.** Looser gates, two concurrent positions, larger stake, Ladder overlay on (up to 2×). Highest throughput and variance. |
+| `recovery_first` | **Drawdown guard.** Small stake, strict gates, recovery/probation emphasized with a longer post-recovery pause. Built to rebuild after a rough stretch. |
+
+A format only seeds **defaults** (`os.environ.setdefault`): any environment variable you set explicitly always wins, so you can pick a format and still override an individual knob (e.g. `NORMAL_TRADE_SIZE` to size to your bankroll). All formats default to `DEMO_MODE=true` (paper) — going live is an explicit `DEMO_MODE=false`. See [`formats.py`](formats.py).
+
+---
+
+## Management Dashboard
+
+A lightweight Flask control panel ([`dashboard/`](dashboard/)) to pick a Trading Format, start/stop the worker, and watch live status (balance, P&L, win rate + Wilson CI, active sizing mode, open positions) — instead of editing env vars by hand. It runs `bot.py` as an isolated worker per account, so it is **single-account today but multi-tenant-ready**: the account store is a list and every worker gets its own state directory.
+
+```bash
+pip install -r requirements.txt
+DASHBOARD_PASSWORD=yourpassword python -m dashboard.app   # http://localhost:8080
+```
+
+- **Default PAPER everywhere.** Switching an account to LIVE (real money) requires typing a confirmation in Settings.
+- Kalshi credentials are entered in the GUI; the private key is stored under the account's own directory and never echoed back. **Client funds stay in the client's own Kalshi account** — the dashboard only needs a trade-scoped API key.
+- **The existing headless bot is unchanged.** `railway.toml` still starts the trader with `python bot.py`. Run the dashboard as a **separate** Railway service whose start command (set in the Railway UI) is `python -m dashboard.app`. Selecting the default `balanced` format — or running with no `TRADING_FORMAT` at all — does not alter the bot's sizing or any trading logic.
+
+See [`BUSINESS_PLAN.md`](BUSINESS_PLAN.md) for the managed-service model this enables.
+
+---
+
 ## Risk Controls
 
 | Control | Behavior |
@@ -98,11 +136,15 @@ This gives paper mode results that correlate with actual market outcomes.
 
 | File | Purpose |
 |---|---|
-| `bot.py` | Main trading bot — runs on Railway |
+| `bot.py` | Main trading bot — runs as the worker |
+| `formats.py` | Trading Format presets (`TRADING_FORMAT`) |
+| `dashboard/` | Flask management dashboard (run/monitor/select format) |
+| `ladder.py` | Opt-in performance stake overlay |
 | `telegram_utils.py` | Telegram notification module |
-| `test_bot.py` | Pytest test suite — risk controls + signal math |
+| `test_bot.py` / `test_formats.py` / `test_dashboard.py` / `test_ladder.py` | Pytest suites |
+| `BUSINESS_PLAN.md` | Managed-service business plan |
 | `requirements.txt` | Python dependencies |
-| `railway.toml` | Railway deployment config |
+| `Procfile` / `railway.toml` | Deployment config |
 
 ---
 

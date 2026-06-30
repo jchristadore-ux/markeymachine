@@ -270,6 +270,7 @@ import math
 import os
 import random
 import signal
+import sys
 import time
 import uuid
 from collections import deque
@@ -344,6 +345,24 @@ def _env_bool(key: str, default: bool) -> bool:
         return default
     return raw in ("true", "1", "yes")
 
+
+# ── Trading Format preset overlay ─────────────────────────────────────────────
+# A "Trading Format" is a named bundle of the env values below (sizing posture,
+# gate strictness, ladder/recovery toggles). apply_format() seeds the selected
+# preset's values into the environment with setdefault BEFORE the config block
+# reads them, so the whole posture switches with one knob (TRADING_FORMAT) while
+# any explicit env var still wins. See formats.py. Must run before the first
+# _require()/_env_* read. `--list-formats` is handled here so it works without
+# Kalshi credentials (the _require() calls below would otherwise abort import).
+from formats import apply_format, print_formats  # noqa: E402
+
+if "--list-formats" in sys.argv:
+    print_formats()
+    raise SystemExit(0)
+for _arg in sys.argv[1:]:
+    if _arg.startswith("--format="):
+        os.environ.setdefault("TRADING_FORMAT", _arg.split("=", 1)[1])
+TRADING_FORMAT = apply_format(os.environ.get("TRADING_FORMAT", "balanced"))
 
 KALSHI_API_KEY_ID   = _require("KALSHI_API_KEY_ID")
 _RAW_PEM            = _require("KALSHI_PRIVATE_KEY_PEM")
@@ -421,6 +440,13 @@ PROBATION_WINRATE_MIN_TRADES = _env_int("PROBATION_WINRATE_MIN_TRADES", 4)
 PROBATION_RUNGS_RAW          = os.environ.get("PROBATION_RUNGS", "").strip()
 PROBATION_STATE_PATH         = os.environ.get("PROBATION_STATE_PATH", "probation_state.json")
 PROBATION_PERSIST            = _env_bool("PROBATION_PERSIST", True)
+
+# ── Dashboard / observability ─────────────────────────────────────────────────
+# When set, the bot writes a small JSON status snapshot once per main-loop cycle
+# (balance, PnL, W/L, active sizing mode, open positions, last signal). The web
+# dashboard reads this to render live status. Unset → no snapshot is written and
+# a standalone `python bot.py` run is completely unaffected.
+STATUS_SNAPSHOT_PATH = os.environ.get("STATUS_SNAPSHOT_PATH", "").strip()
 
 
 def _probation_rungs() -> "list[float]":
@@ -2464,6 +2490,55 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -
     )
 
 
+def write_status_snapshot(balance: float) -> None:
+    """Write a small JSON status snapshot for the web dashboard.
+
+    No-op unless STATUS_SNAPSHOT_PATH is set, so a standalone `python bot.py`
+    run is unaffected. Never raises — observability must not break trading.
+    """
+    if not STATUS_SNAPSHOT_PATH:
+        return
+    try:
+        if DEMO_MODE:
+            resolved = [t for t in trade_history if t.get("result") in ("win", "loss")]
+            wins   = sum(1 for t in resolved if t["result"] == "win")
+            losses = len(resolved) - wins
+            session_pnl = paper_daily_pnl
+        else:
+            wins, losses = live_wins, live_losses
+            session_pnl = live_daily_realized
+        total = wins + losses
+        # wilson_confidence already returns percentages: (rate%, lower%, upper%).
+        rate_pct, lo_pct, hi_pct = wilson_confidence(wins, total) if total > 0 else (0.0, 0.0, 0.0)
+        active_mode = ("recovery" if recovery.active
+                       else "probation" if probation.active else "normal")
+        snapshot = {
+            "version": BOT_VERSION,
+            "trading_format": TRADING_FORMAT,
+            "demo_mode": DEMO_MODE,
+            "balance": round(float(balance), 2),
+            "session_pnl": round(float(session_pnl), 2),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": rate_pct,
+            "wilson_ci": [lo_pct, hi_pct],
+            "active_mode": active_mode,
+            "active_trade_size": round(active_trade_size(), 2),
+            "open_positions": len(open_orders),
+            "open_tickers": [o.get("ticker", "") for o in open_orders.values()],
+            "session_state": session_state.value,
+            "halted": _session_halted,
+            "last_signal": last_signal_desc,
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        tmp = STATUS_SNAPSHOT_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, STATUS_SNAPSHOT_PATH)
+    except Exception as e:  # pragma: no cover - observability must never break trading
+        log.debug("status snapshot write failed: %s", e)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN DECISION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2730,6 +2805,7 @@ def main() -> None:
 
     log.info("━" * 70)
     log.info("  MARKEYMACHINE %s │ %s", BOT_VERSION, "PAPER 🟡" if DEMO_MODE else "LIVE 🔴")
+    log.info("  Trading Format: %s", TRADING_FORMAT)
     log.info("  Start: %s", _session_start_ts)
     log.info("  Regime R²≥%.2f | VolCap=%.3f%% | Circuit=%.2f%%",
              R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
@@ -2843,6 +2919,7 @@ def main() -> None:
             if recovery.maybe_exit(current_balance):
                 probation.start(_probation_rungs(), NORMAL_TRADE_SIZE)
             run_decision(market, current_balance)
+            write_status_snapshot(current_balance)
 
             resolve_cycle += 1
             if resolve_cycle % 3 == 0:
