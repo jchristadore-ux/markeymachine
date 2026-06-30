@@ -2,8 +2,8 @@
 {% block title %} · Dashboard{% endblock %}
 {% block content %}
 
-{% if not password_set %}
-  <div class="flash error">No DASHBOARD_PASSWORD set — this panel is unauthenticated. Set one before exposing it.</div>
+{% if not live_enabled %}
+  <div class="flash ok">Practice (paper) mode — trades are simulated. No real money is at risk.</div>
 {% endif %}
 
 <div class="row between">

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %} · Admin{% endblock %}
+{% block content %}
+<h1>Admin overview</h1>
+<p class="muted">{{ user_count }} user(s) · {{ rows|length }} account(s)</p>
+
+<section class="card">
+  <table class="kv">
+    <tr>
+      <td class="mono"><strong>Owner</strong></td>
+      <td class="mono"><strong>Account</strong></td>
+      <td class="mono"><strong>Format</strong></td>
+      <td class="mono"><strong>Creds</strong></td>
+      <td class="mono"><strong>Worker</strong></td>
+    </tr>
+    {% for r in rows %}
+    <tr>
+      <td class="mono">{{ r.owner_email }}</td>
+      <td class="mono">{{ r.account.label }} <span class="muted">({{ r.account.id }})</span></td>
+      <td class="mono">{{ r.account.trading_format }}</td>
+      <td class="mono">{{ 'yes' if r.account.has_credentials else 'no' }}</td>
+      <td class="mono">{{ 'running' if r.running else 'stopped' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endblock %}

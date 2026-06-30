@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
+
+_LOCK = threading.RLock()
 
 # Root for all dashboard-managed state. Resolved dynamically (not captured at
 # import) so DASHBOARD_DATA_DIR can be set by the host — or per-test — at any time.
@@ -35,6 +38,8 @@ class Account:
 
     label: str
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    # Which user owns this account. Empty for legacy single-tenant rows.
+    owner_user_id: str = ""
     kalshi_key_id: str = ""
     # Path to the PEM file on disk (content lives in the account dir, not here).
     kalshi_pem_path: str = ""
@@ -89,11 +94,12 @@ class AccountStore:
             self._accounts = []
 
     def save(self) -> None:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"accounts": [asdict(a) for a in self._accounts]}, f, indent=2)
-        os.replace(tmp, self.path)
+        with _LOCK:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"accounts": [asdict(a) for a in self._accounts]}, f, indent=2)
+            os.replace(tmp, self.path)
 
     def all(self) -> List[Account]:
         return list(self._accounts)
@@ -101,24 +107,32 @@ class AccountStore:
     def get(self, account_id: str) -> Optional[Account]:
         return next((a for a in self._accounts if a.id == account_id), None)
 
+    def for_user(self, user_id: str) -> List[Account]:
+        """Every account owned by this user — the only ones they may see."""
+        return [a for a in self._accounts if a.owner_user_id == user_id]
+
     def add(self, account: Account) -> Account:
-        account.ensure_dirs()
-        self._accounts.append(account)
-        self.save()
+        with _LOCK:
+            self.load()  # re-read so concurrent writers don't clobber each other
+            account.ensure_dirs()
+            self._accounts.append(account)
+            self.save()
         return account
 
     def update(self, account: Account) -> None:
-        for i, a in enumerate(self._accounts):
-            if a.id == account.id:
-                self._accounts[i] = account
-                self.save()
-                return
-        raise KeyError(account.id)
+        with _LOCK:
+            self.load()
+            for i, a in enumerate(self._accounts):
+                if a.id == account.id:
+                    self._accounts[i] = account
+                    self.save()
+                    return
+            raise KeyError(account.id)
 
-    def ensure_default(self) -> Account:
-        """Single-account convenience: create one account if the store is empty
-        so the dashboard always has something to show."""
-        if not self._accounts:
-            acct = Account(label="My Kalshi Account")
-            self.add(acct)
-        return self._accounts[0]
+    def ensure_for_user(self, user_id: str, label: str = "My Kalshi Account") -> Account:
+        """Return this user's account, creating one (paper, no creds) on first
+        login so every customer always has exactly one to configure."""
+        existing = self.for_user(user_id)
+        if existing:
+            return existing[0]
+        return self.add(Account(label=label, owner_user_id=user_id))

@@ -10,14 +10,19 @@
 <body>
   <header class="topbar">
     <a class="brand" href="{{ url_for('index') }}">MarkeyMachine</a>
-    {% if request.endpoint != 'login' %}
     <nav>
-      <a href="{{ url_for('index') }}">Dashboard</a>
-      <a href="{{ url_for('formats_page') }}">Formats</a>
-      <a href="{{ url_for('settings_page') }}">Settings</a>
-      <a class="muted" href="{{ url_for('logout') }}">Log out</a>
+      {% if current_user %}
+        <a href="{{ url_for('index') }}">Dashboard</a>
+        <a href="{{ url_for('formats_page') }}">Formats</a>
+        <a href="{{ url_for('settings_page') }}">Settings</a>
+        {% if current_user.is_admin %}<a href="{{ url_for('admin') }}">Admin</a>{% endif %}
+        <span class="muted small">{{ current_user.email }}</span>
+        <a class="muted" href="{{ url_for('logout') }}">Log out</a>
+      {% elif request.endpoint not in ('login', 'signup') %}
+        <a href="{{ url_for('login') }}">Log in</a>
+        <a href="{{ url_for('signup') }}">Sign up</a>
+      {% endif %}
     </nav>
-    {% endif %}
   </header>
 
   <main>

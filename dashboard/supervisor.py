@@ -39,7 +39,12 @@ def compose_env(account: Account) -> Dict[str, str]:
     """
     env = dict(os.environ)
     env["TRADING_FORMAT"] = account.trading_format
-    env["DEMO_MODE"] = "true" if account.demo_mode else "false"
+    # Hard safety: a worker may only run live if the site-wide flag is on AND the
+    # account opted in. In Phase 1 (paper) DASHBOARD_ALLOW_LIVE is unset, so every
+    # worker is forced to paper regardless of the account's stored flag.
+    live_allowed = os.environ.get("DASHBOARD_ALLOW_LIVE", "").lower() == "true"
+    demo = True if not live_allowed else account.demo_mode
+    env["DEMO_MODE"] = "true" if demo else "false"
     env["KALSHI_API_KEY_ID"] = account.kalshi_key_id
     if account.kalshi_pem_path and os.path.exists(account.kalshi_pem_path):
         with open(account.kalshi_pem_path) as f:

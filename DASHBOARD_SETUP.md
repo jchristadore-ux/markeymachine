@@ -21,12 +21,24 @@ project as your bot. Your existing bot service is not touched.
 - Save. This makes the service run `python -m dashboard.app` instead of the bot.
 
 ## 3. Add variables
+The dashboard is **multi-tenant**: customers sign up themselves with an email +
+password, and each one is isolated (their own account, their own Kalshi key,
+their own paper bot). There is **no shared password** anymore.
+
 New service → **Variables**:
-- `DASHBOARD_PASSWORD` = a login password you choose
-- `DASHBOARD_SECRET_KEY` = any long random string
-- *(recommended)* add a **Volume**, then `DASHBOARD_DATA_DIR` = `/data`
-  (set the volume's mount path to `/data`) so your accounts/settings survive
-  redeploys.
+- `DASHBOARD_SECRET_KEY` = a long random string (signs login cookies — keep it
+  secret and stable).
+- `DASHBOARD_COOKIE_SECURE` = `true` (you're on HTTPS via the Railway domain).
+- `ADMIN_EMAILS` = your email (comma-separated for more). Those users get an
+  **Admin** tab showing every account.
+- **Add a Volume** and set `DASHBOARD_DATA_DIR` = `/data` (volume mount path
+  `/data`). This is **strongly recommended** — it's where customer logins,
+  accounts, and keys live; without it they reset on every redeploy.
+
+> **Phase 1 is paper-only.** Live (real-money) trading is intentionally disabled
+> for everyone — there is no `DASHBOARD_ALLOW_LIVE` flag set, so every customer
+> bot runs in paper regardless. Do not enable live until the legal/compliance and
+> key-encryption work (Phase 2) is done.
 
 ## 4. Domain & port
 The dashboard is served by **gunicorn** (a production web server), bound to the
@@ -52,18 +64,23 @@ This means the container is up but the domain isn't reaching the web port. Fix:
 3. As a deterministic option, add a **Variable** `PORT` = `8080`, set the
    domain's target port to `8080`, and redeploy.
 
-## 5. Use it
-1. Open the domain → log in with `DASHBOARD_PASSWORD`.
-2. **Settings** → enter your Kalshi **API Key ID** + paste the **Private Key
+## 5. Use it (you and your customers)
+1. Open the domain. You and each customer **Sign up** with an email + password.
+2. **Settings** → enter the Kalshi **API Key ID** + paste the **Private Key
    (PEM)**, set a paper starting balance, optional Telegram → **Save**.
+   (Each customer's funds stay in their own Kalshi account; the key can be
+   revoked from Kalshi at any time.)
 3. **Formats** → pick one (start with **Conservative** or **Balanced**).
-4. **Dashboard** → **Start**. It runs in **PAPER** by default (no real money).
-   Status cards fill in within a minute or two.
-5. Going live later: **Settings → Trading mode → type `LIVE` → Restart**.
+4. **Dashboard** → **Start**. It runs in **PAPER** (practice) mode — no real
+   money. Status cards fill in within a minute or two.
+5. As an admin (`ADMIN_EMAILS`), the **Admin** tab lists every account and its
+   status.
 
-## Safety
-- ⚠️ **Never run two LIVE bots on the same Kalshi account.** Keep the dashboard
-  in **paper** while your existing bot trades live. To run the dashboard live,
-  stop/delete the standalone bot service first.
-- After a Railway redeploy you may need to click **Start** again to relaunch the
-  worker.
+## Safety / Phase-1 limits
+- **Paper only.** Live trading is disabled site-wide in Phase 1, so the dashboard
+  cannot place real orders — it can run safely alongside your separate live bot
+  service without any risk of double-trading.
+- **Customer keys are stored on disk (not yet encrypted).** Fine for a small
+  paper beta; this must become encryption-at-rest / a secrets manager before any
+  real-money/live phase. Use a Volume and keep `DASHBOARD_SECRET_KEY` private.
+- After a Railway redeploy, each running worker may need **Start** clicked again.
