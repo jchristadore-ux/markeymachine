@@ -38,6 +38,8 @@ The stake is **derived from a persistent mode** via `active_trade_size()`:
 
 Recovery state `{active, target}` is persisted atomically and reconciled on boot, so it survives an in-container restart and can never wedge. See [`TRADING_DOCTRINE.md`](TRADING_DOCTRINE.md) §5 for the full lifecycle and edge-case guarantees. **For redeploy-durable recovery state on Railway, mount a Volume and set `RECOVERY_STATE_PATH` to a path on it.**
 
+- **Daily slow-roll ramp** *(v9.7.0)* → the first trade of **every** UTC trading day re-enters the probation ramp at the floor and climbs `$100 → $250 → $500` (the same `RECOVERY_TRADE_SIZE → … → NORMAL_TRADE_SIZE` rungs used after a recovery exit). It advances one rung on a `PROBATION_WIN_STREAK`-win streak **or** a `≥PROBATION_WIN_RATE_MIN` rolling win rate, steps down a rung on a loss, and graduates to full size at the top. This keeps the bot from opening a fresh day cold at full size. The re-arm is **skipped while Recovery is active** (the deeper claw-back tier wins), and a restart that crosses midnight re-arms on boot via a persisted arm-date. Disable with `PROBATION_RAMP_ENABLED=false` (every day then stays full size).
+
 ### Execution — Maker Limit Orders
 Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee. Takers pay ~1% of winnings. Fee drag on taker orders: ~$5+/day at scale.
 
