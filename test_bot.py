@@ -969,23 +969,51 @@ class TestCancelStaleOrders:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestPerformanceGuard:
-    def test_below_min_sample_passes(self, monkeypatch):
+    """v9.9.0: the guard de-rates the stake below the Wilson floor instead of
+    hard-blocking. A hard block froze the live win record and deadlocked the bot
+    (2026-07-03: 11/20, LB 37.2% < 50%, 4,554 warnings, zero trades)."""
+
+    def test_below_min_sample_full_size(self, monkeypatch):
         monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
         monkeypatch.setattr(bot, "live_wins", 3)
         monkeypatch.setattr(bot, "live_losses", 5)
-        assert bot.performance_guard() is True
+        assert bot.performance_guard_multiplier() == 1.0
 
-    def test_good_win_rate_passes(self, monkeypatch):
+    def test_good_win_rate_full_size(self, monkeypatch):
         monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
         monkeypatch.setattr(bot, "live_wins", 16)
         monkeypatch.setattr(bot, "live_losses", 4)
-        assert bot.performance_guard() is True
+        assert bot.performance_guard_multiplier() == 1.0
 
-    def test_bad_win_rate_blocks(self, monkeypatch):
+    def test_bad_win_rate_derates_not_blocks(self, monkeypatch):
         monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
+        monkeypatch.setattr(bot, "PERF_GUARD_FLOOR", 0.50)
+        monkeypatch.setattr(bot, "PERF_GUARD_DERATE", 0.25)
         monkeypatch.setattr(bot, "live_wins", 8)
         monkeypatch.setattr(bot, "live_losses", 22)
-        assert bot.performance_guard() is False
+        # Below the floor: de-rated, but never zero (that would re-freeze).
+        assert bot.performance_guard_multiplier() == 0.25
+
+    def test_deadlock_case_still_trades(self, monkeypatch):
+        # The exact 2026-07-03 lockout: 11/20 (LB 37.2%) crossed the sample
+        # threshold on a winning streak. Under the old guard this returned
+        # False forever; it must now de-rate, not block.
+        monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
+        monkeypatch.setattr(bot, "PERF_GUARD_FLOOR", 0.50)
+        monkeypatch.setattr(bot, "PERF_GUARD_DERATE", 0.25)
+        monkeypatch.setattr(bot, "live_wins", 11)
+        monkeypatch.setattr(bot, "live_losses", 9)
+        assert 0.0 < bot.performance_guard_multiplier() < 1.0
+
+    def test_derate_zero_restores_hard_block(self, monkeypatch):
+        # PERF_GUARD_DERATE=0.0 opts back into the legacy freeze: a zero stake
+        # is skipped by the downstream min-bet check.
+        monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
+        monkeypatch.setattr(bot, "PERF_GUARD_FLOOR", 0.50)
+        monkeypatch.setattr(bot, "PERF_GUARD_DERATE", 0.0)
+        monkeypatch.setattr(bot, "live_wins", 8)
+        monkeypatch.setattr(bot, "live_losses", 22)
+        assert bot.performance_guard_multiplier() == 0.0
 
 
 class TestUpdateLivePrior:

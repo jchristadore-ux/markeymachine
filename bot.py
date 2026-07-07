@@ -1,7 +1,26 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.8.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.9.0  —  Production Build                                  ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.9.0 — PERF-GUARD DEADLOCK FIX (de-rate, don't hard-block)                ║
+║  DIAGNOSIS (2026-07-03→06 logs, ZERO trades for ~2.6 days): the statistical  ║
+║  performance guard HARD-BLOCKED every trade whenever the live Wilson lower   ║
+║  bound sat below its 50% floor. But the live win record only moves when a    ║
+║  trade SETTLES, so the block is self-locking: no trades → no settlements →   ║
+║  Wilson LB frozen below the floor → blocked forever. The bot crossed         ║
+║  MIN_SAMPLE_TRADES on a 5-win streak (11/20, LB 37.2%) and locked itself     ║
+║  out — 4,554 PERF GUARD warnings, zero trades — with live markets and a      ║
+║  positive P&L. (v9.0.8 patched a seeding variant; this is the same deadlock  ║
+║  via live records — the guard's core self-reference, not stale history.)     ║
+║                                                                              ║
+║  FIX: the guard no longer hard-blocks on the Wilson floor. Below the floor   ║
+║  it DE-RATES the stake (PERF_GUARD_DERATE, default 0.25×) inside kelly_bet   ║
+║  instead of stopping. Small trades still settle, so the record keeps moving: ║
+║  a real edge climbs back above the floor and the multiplier returns to 1.0,  ║
+║  while a broken strategy only bleeds slowly — a signal to intervene, not a   ║
+║  silent freeze. RAILWAY (optional): PERF_GUARD_FLOOR (0.50),                 ║
+║  PERF_GUARD_DERATE (0.25; set 0.0 to restore the legacy hard-block).         ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.8.0 — BALANCE-GATED $1000 CEILING: the slow-roll ramp can now climb to   ║
 ║  $750 and $1000, but only once the book can absorb it.                       ║
@@ -287,7 +306,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.8.0"
+BOT_VERSION = "9.9.0"
 
 import base64
 import json
@@ -557,6 +576,13 @@ STREAK_PAUSE_SECS     = _env_int("STREAK_PAUSE_SECS", 1800)
 STALE_ORDER_TIMEOUT   = _env_int("STALE_ORDER_TIMEOUT", 300)
 MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 1)
 MIN_SAMPLE_TRADES     = _env_int("MIN_SAMPLE_TRADES", 20)
+# Statistical performance guard. Below PERF_GUARD_FLOOR (Wilson lower bound of
+# the live win rate) the guard DE-RATES the stake by PERF_GUARD_DERATE instead
+# of hard-blocking — a hard block freezes the win record and deadlocks the bot
+# (see performance_guard_multiplier). Set PERF_GUARD_DERATE=0.0 to restore the
+# legacy hard-block behaviour.
+PERF_GUARD_FLOOR      = _env_float("PERF_GUARD_FLOOR", 0.50)
+PERF_GUARD_DERATE     = _env_float("PERF_GUARD_DERATE", 0.25)
 
 # ── Regime detection ──────────────────────────────────────────────────────────
 # v9.3.0: restored 0.62 → 0.65 (doctrine §8). 0.62 was a v9.0.6 throughput
@@ -1970,9 +1996,12 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
         cap_mult = 1.0 if in_clawback() else stake_ladder.cfg.max_multiplier
         ceiling  = min(cap_mult * size, balance)
         decision = stake_ladder.get_stake(base_bet, max_stake=ceiling)
-        return decision.stake
+        base_bet = decision.stake
 
-    return base_bet
+    # Statistical performance guard: de-rate (never hard-block) on a sub-floor
+    # live Wilson LB. Applied last so it scales whatever the mode/ladder sized,
+    # and clamped to cash on hand. See performance_guard_multiplier().
+    return round(min(base_bet * performance_guard_multiplier(), balance), 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2012,15 +2041,36 @@ def update_live_prior() -> None:
     log.debug("Prior → %.3f (n=%d)", _live_prior, total)
 
 
-def performance_guard() -> bool:
+def performance_guard_multiplier() -> float:
+    """Stake multiplier from the statistical performance guard.
+
+    The guard used to HARD-BLOCK every trade whenever the live Wilson lower
+    bound sat below the 50% floor. But the live win record only moves when a
+    trade SETTLES, so a hard block is self-locking: no trades → no new
+    settlements → Wilson LB frozen below the floor → guard blocks forever. On
+    2026-07-03 the bot crossed MIN_SAMPLE_TRADES on a 5-win streak (11/20, LB
+    37.2%) and locked itself out for days — 4,554 PERF GUARD warnings, zero
+    trades — despite live markets and a positive P&L. (An adjacent seeding
+    variant was patched in v9.0.8; this is the same deadlock via live records.)
+
+    Fix: never hard-block on the Wilson floor. Below the floor we DE-RATE the
+    stake (PERF_GUARD_DERATE, e.g. 0.25×) instead of stopping. Small trades
+    still settle, so the record keeps moving: a real edge climbs back above the
+    floor on its own and the multiplier returns to 1.0, while a strategy that is
+    genuinely broken bleeds only slowly at reduced size — a signal to intervene,
+    not a silent freeze. Returns 1.0 when the sample is too small to judge or
+    the Wilson LB is at/above the floor. Set PERF_GUARD_DERATE=0.0 to restore
+    the legacy hard-block (a zero stake is skipped downstream by the min-bet
+    check), accepting the deadlock risk that implies."""
     total = live_wins + live_losses
     if total < MIN_SAMPLE_TRADES:
-        return True
+        return 1.0
     wlb = wilson_lower_bound(live_wins, total)
-    if wlb < 0.50:
-        log.warning("PERF GUARD │ Wilson LB %.1f%% < 50%%", wlb * 100)
-        return False
-    return True
+    if wlb < PERF_GUARD_FLOOR:
+        log.warning("PERF GUARD │ Wilson LB %.1f%% < %.0f%% — de-rating stake ×%.2f",
+                    wlb * 100, PERF_GUARD_FLOOR * 100, PERF_GUARD_DERATE)
+        return PERF_GUARD_DERATE
+    return 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2849,9 +2899,11 @@ def run_decision(market: dict, balance: float) -> None:
     if not streak_check():
         last_signal_desc = f"streak pause ({consecutive_losses}L)"
         return
-    if not performance_guard():
-        last_signal_desc = "perf guard (Wilson LB < 50%)"
-        return
+    # v9.9.0: the statistical performance guard no longer hard-blocks here — a
+    # hard block on the Wilson floor froze the win record and deadlocked the bot
+    # (2026-07-03, 4,554 PERF GUARD warnings / zero trades). It now de-rates the
+    # stake inside kelly_bet() via performance_guard_multiplier(), so poor recent
+    # form shrinks size instead of stopping evaluation entirely.
     if not session_quality_check():
         last_signal_desc = f"session quality UTC{datetime.now(timezone.utc).hour}"
         return
