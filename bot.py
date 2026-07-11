@@ -919,15 +919,30 @@ class RecoveryState:
         self.active         = True
         self.target_balance = round(float(target_balance), 2)
         self._save()
-        log.warning("Recovery mode ACTIVATED after losing full-size trade.")
-        log.warning("Previous balance: $%.2f", self.target_balance)
-        log.warning("Recovery target: $%.2f", self.target_balance)
-        log.warning("Switching trade size to: $%.2f", RECOVERY_TRADE_SIZE)
-        tg.send_telegram_message(
-            f"🛟 RECOVERY MODE ACTIVATED\n"
-            f"Recovery target: ${self.target_balance:.2f}\n"
-            f"Trade size → ${RECOVERY_TRADE_SIZE:.2f} (was ${NORMAL_TRADE_SIZE:.2f})"
-        )
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            # Sizing-neutral mode: report exactly what happens — recovery is
+            # triggered and tracked, but NOTHING about sizing changes.
+            log.warning("Recovery mode TRIGGERED (tracking only — "
+                        "RECOVERY_KEEP_NORMAL_STAKE).")
+            log.warning("Recovery target: $%.2f", self.target_balance)
+            log.warning("Stake UNCHANGED at normal base $%.2f; laddering "
+                        "unchanged.", NORMAL_TRADE_SIZE)
+            tg.send_telegram_message(
+                f"🛟 RECOVERY MODE TRIGGERED (tracking only)\n"
+                f"Recovery target: ${self.target_balance:.2f}\n"
+                f"Everything stays the same — stake remains "
+                f"${NORMAL_TRADE_SIZE:.2f} and existing laddering is unchanged."
+            )
+        else:
+            log.warning("Recovery mode ACTIVATED after losing full-size trade.")
+            log.warning("Previous balance: $%.2f", self.target_balance)
+            log.warning("Recovery target: $%.2f", self.target_balance)
+            log.warning("Switching trade size to: $%.2f", RECOVERY_TRADE_SIZE)
+            tg.send_telegram_message(
+                f"🛟 RECOVERY MODE ACTIVATED\n"
+                f"Recovery target: ${self.target_balance:.2f}\n"
+                f"Trade size → ${RECOVERY_TRADE_SIZE:.2f} (was ${NORMAL_TRADE_SIZE:.2f})"
+            )
         return True
 
     def maybe_exit(self, current_balance: float) -> bool:
@@ -943,17 +958,24 @@ class RecoveryState:
         self._save()
         log.warning("Recovery target reached.")
         log.warning("Recovery mode DEACTIVATED.")
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            # Sizing-neutral mode: the stake never changed, so there is nothing to
+            # switch back and no ladder pause to apply. Report it plainly.
+            log.warning("Stake was UNCHANGED throughout at normal base $%.2f; "
+                        "laddering unchanged.", NORMAL_TRADE_SIZE)
+            tg.send_telegram_message(
+                f"✅ RECOVERY COMPLETE — balance ${current_balance:.2f} ≥ target "
+                f"${reached:.2f}\nNothing changed — stake stayed at "
+                f"${NORMAL_TRADE_SIZE:.2f} and existing laddering was unchanged."
+            )
+            return True
         log.warning("Switching trade size back to: $%.2f", NORMAL_TRADE_SIZE)
         msg = (f"✅ RECOVERY COMPLETE — balance ${current_balance:.2f} ≥ target "
                f"${reached:.2f}\nTrade size → ${NORMAL_TRADE_SIZE:.2f}")
         # Make the ladder re-prove the edge on fresh data: hold its win-rate
         # size-up at baseline for the next RECOVERY_LADDER_PAUSE_TRADES trades
         # before it can scale the stake above NORMAL_TRADE_SIZE again.
-        # RECOVERY_KEEP_NORMAL_STAKE turns this OFF: recovery never changed the
-        # stake, so there is nothing to re-prove — the ladder keeps sizing exactly
-        # as it did throughout, with no post-exit pause.
-        if (not RECOVERY_KEEP_NORMAL_STAKE
-                and stake_ladder is not None and RECOVERY_LADDER_PAUSE_TRADES > 0):
+        if stake_ladder is not None and RECOVERY_LADDER_PAUSE_TRADES > 0:
             stake_ladder.pause_size_up(RECOVERY_LADDER_PAUSE_TRADES)
             msg += (f"\nLadder size-up paused for "
                     f"{RECOVERY_LADDER_PAUSE_TRADES} trades.")
@@ -976,11 +998,22 @@ class RecoveryState:
                      "exiting recovery.", current_balance, self.target_balance)
             self.maybe_exit(current_balance)
             return
-        log.warning("Recovery boot │ RESUMING recovery. Balance $%.2f, target "
-                    "$%.2f, trade size $%.2f.",
-                    current_balance, self.target_balance, RECOVERY_TRADE_SIZE)
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            log.warning("Recovery boot │ RESUMING recovery (tracking only). "
+                        "Balance $%.2f, target $%.2f, stake UNCHANGED at normal "
+                        "base $%.2f.",
+                        current_balance, self.target_balance, NORMAL_TRADE_SIZE)
+        else:
+            log.warning("Recovery boot │ RESUMING recovery. Balance $%.2f, target "
+                        "$%.2f, trade size $%.2f.",
+                        current_balance, self.target_balance, RECOVERY_TRADE_SIZE)
 
     def status_line(self, current_balance: float) -> str:
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            return (f"Recovery mode active (tracking only). Current balance: "
+                    f"${current_balance:.2f}. Target: ${self.target_balance:.2f}. "
+                    f"Stake: ${NORMAL_TRADE_SIZE:.2f} (unchanged); laddering "
+                    f"unchanged.")
         return (f"Recovery mode active. Current balance: ${current_balance:.2f}. "
                 f"Target: ${self.target_balance:.2f}. "
                 f"Trade size: ${RECOVERY_TRADE_SIZE:.2f}.")
@@ -3224,8 +3257,10 @@ def main() -> None:
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
     log.info("  Momentum lookback=%d intervals | thresh≥%.2f%% or R²≥%.2f",
              MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
-    log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
-             NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
+    log.info("  Sizing: normal=$%.0f recovery=$%.0f%s | active=$%.0f%s",
+             NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE,
+             " (tracking-only: stake stays normal)" if RECOVERY_KEEP_NORMAL_STAKE else "",
+             active_trade_size(),
              " (TEMP override, hard stake $%.0f → retires at $%.0f)"
              % (temp_override.current_size(), TEMP_OVERRIDE_EXIT_BALANCE)
              if temp_override.active else
