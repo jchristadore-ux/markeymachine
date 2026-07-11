@@ -441,34 +441,35 @@ KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
 RECOVERY_STATE_PATH = os.environ.get("RECOVERY_STATE_PATH", "recovery_state.json")
 RECOVERY_PERSIST    = _env_bool("RECOVERY_PERSIST", True)
 
-# ── Recovery decision engine as the universal engine (owner directive) ─────────
+# ── Recovery as a sizing-neutral (telemetry-only) state (owner directive) ──────
 # WHY (owner observation): the book trades noticeably better while in Recovery
-# Mode — higher win rate, better setups — but often gives the gains back the
-# moment recovery clears and the stake ladders back to full size. The premise
-# is that Recovery uses a *different trade-evaluation engine*.
+# Mode and often gives the gains back once recovery clears and the stake ladders
+# back up. The premise was that Recovery uses a *different trade-evaluation
+# engine*.
 #
-# THE ACTUAL ARCHITECTURE (see run_decision + the audit in the deliverables note
-# of the PR): the trade DECISION engine is ALREADY universal. run_decision() and
-# every gate it calls (expiry/spread/cooldown/daily-loss/streak/session-quality/
-# regime/order-book/momentum/win-prob/confidence/price/edge/kelly) are entirely
-# state-independent — none of them branch on recovery. `recovery.active` only
-# ever changes POSITION SIZING (active_trade_size → RECOVERY_TRADE_SIZE, and the
-# in_clawback() ladder-cap). So there is no separate "recovery engine" to graft
-# onto normal mode; the engine is one and the same before, during, and after
-# recovery. What actually differs is the size of the loss you take: recovery
-# stakes are small, and after recovery clears the stake climbs back up (probation
-# ramp + the ladder size-up pause), so the first full-size loss is large.
+# THE ACTUAL ARCHITECTURE (audit): the trade DECISION engine is ALREADY
+# universal. run_decision() and every gate it calls (expiry/spread/cooldown/
+# daily-loss/streak/session-quality/regime/order-book/momentum/win-prob/
+# confidence/price/edge/kelly) are entirely state-independent — none branch on
+# recovery. `recovery.active` ONLY ever changes POSITION SIZING: it drops the
+# stake to RECOVERY_TRADE_SIZE (active_trade_size), pins the laddering overlay at
+# 1× (in_clawback), and on exit runs a graduated probation ramp + a ladder
+# size-up pause. So the ONLY thing that differs across the recovery boundary is
+# how much is risked — never how trades are selected.
 #
-# WHAT THIS FLAG DOES: when ON, Recovery becomes a PURE bankroll/position-sizing
-# mode. The instant the recovery target is reached, recovery exits AND the bot
-# resumes its normal ladder stake immediately — it does NOT step through the
-# post-recovery probation ramp, and it does NOT pause the ladder's size-up. The
-# (already-universal) decision engine is untouched: the only thing that changes
-# across the recovery boundary is how much is risked, never how trades are
-# selected. When OFF the bot behaves exactly as before (probation ramp + ladder
-# pause on exit). Recovery still activates and exits on its existing rules either
-# way; recovery sizing is still used only while actually recovering.
-USE_RECOVERY_DECISION_ENGINE = _env_bool("USE_RECOVERY_DECISION_ENGINE", False)
+# WHAT THIS FLAG DOES: when ON, entering Recovery Mode does NOT change any
+# staking. Recovery still activates, tracks its target, logs, and exits on its
+# existing rules — it just becomes telemetry-only for sizing. Concretely, while
+# the flag is ON:
+#   • the stake stays at the NORMAL ladder size (no drop to RECOVERY_TRADE_SIZE),
+#   • the laddering overlay is NOT clawback-capped by recovery,
+#   • on exit there is NO probation ramp and NO ladder size-up pause,
+# so the bot sizes identically whether or not it is "in recovery". When OFF the
+# bot behaves exactly as it does today (two-tier recovery sizing + probation
+# ramp on exit). This flag governs SIZING only; recovery entry/exit accounting
+# (the "recovery"-tagged trade, the target = pre-loss balance, the exit at
+# target) is unchanged either way.
+RECOVERY_KEEP_NORMAL_STAKE = _env_bool("RECOVERY_KEEP_NORMAL_STAKE", False)
 
 
 # ── Laddering stake overlay (opt-in) ──────────────────────────────────────────
@@ -948,10 +949,10 @@ class RecoveryState:
         # Make the ladder re-prove the edge on fresh data: hold its win-rate
         # size-up at baseline for the next RECOVERY_LADDER_PAUSE_TRADES trades
         # before it can scale the stake above NORMAL_TRADE_SIZE again.
-        # USE_RECOVERY_DECISION_ENGINE turns this OFF: recovery is then a pure
-        # position-sizing mode, so on exit the bot resumes its normal ladder stake
-        # immediately with no size-up pause (the decision engine is unchanged).
-        if (not USE_RECOVERY_DECISION_ENGINE
+        # RECOVERY_KEEP_NORMAL_STAKE turns this OFF: recovery never changed the
+        # stake, so there is nothing to re-prove — the ladder keeps sizing exactly
+        # as it did throughout, with no post-exit pause.
+        if (not RECOVERY_KEEP_NORMAL_STAKE
                 and stake_ladder is not None and RECOVERY_LADDER_PAUSE_TRADES > 0):
             stake_ladder.pause_size_up(RECOVERY_LADDER_PAUSE_TRADES)
             msg += (f"\nLadder size-up paused for "
@@ -1252,12 +1253,11 @@ def resume_after_recovery() -> None:
     Normally this begins the graduated probation ramp so the base climbs back to
     full size instead of snapping there (no-op if the ramp is disabled or there
     is no sub-full room, in which case sizing resumes normal). Under
-    USE_RECOVERY_DECISION_ENGINE, recovery is a pure bankroll/position-sizing
-    mode: this is a no-op, so the bot resumes its NORMAL ladder stake immediately
-    while continuing to use the same (already-universal) decision engine. Only
-    position sizing changes across the recovery boundary — never trade quality.
+    RECOVERY_KEEP_NORMAL_STAKE the stake never dropped in the first place, so
+    there is nothing to ramp back up: this is a no-op and the ladder simply
+    carries on at its normal size.
     """
-    if USE_RECOVERY_DECISION_ENGINE:
+    if RECOVERY_KEEP_NORMAL_STAKE:
         return
     probation.start(_probation_rungs(), NORMAL_TRADE_SIZE)
 
@@ -1506,7 +1506,11 @@ def active_trade_size(balance: "float | None" = None) -> float:
     temp_override.check_balance(balance)
     if temp_override.active:
         return temp_override.current_size()
-    if recovery.active:
+    # RECOVERY_KEEP_NORMAL_STAKE makes recovery sizing-neutral: skip the drop to
+    # RECOVERY_TRADE_SIZE so the stake stays on the normal ladder. Recovery is
+    # still active (it tracks/logs/exits normally) — it just no longer resizes.
+    # Probation is cancelled on recovery entry, so this falls through to NORMAL.
+    if recovery.active and not RECOVERY_KEEP_NORMAL_STAKE:
         size = RECOVERY_TRADE_SIZE
     elif probation.active:
         size = probation.current_size()
@@ -1520,8 +1524,13 @@ def in_clawback() -> bool:
     TEMP override is pinning the stake. In this state the laddering overlay is
     capped at the active base — it may size DOWN but never UP — so a win rate
     earned at small stakes cannot re-arm full size, and the override's hard
-    stake cannot be scaled past its hardcoded value."""
-    return recovery.active or probation.active or temp_override.active
+    stake cannot be scaled past its hardcoded value.
+
+    RECOVERY_KEEP_NORMAL_STAKE makes recovery sizing-neutral, so recovery no
+    longer contributes the clawback cap: the ladder behaves exactly as it does
+    in normal mode while recovery is active (probation/override still cap)."""
+    recovery_clawback = recovery.active and not RECOVERY_KEEP_NORMAL_STAKE
+    return recovery_clawback or probation.active or temp_override.active
 
 
 def on_trade_settled(won: bool, trade_rec: dict, current_balance: float) -> None:
@@ -2928,8 +2937,8 @@ def run_decision(market: dict, balance: float) -> None:
     Kelly) is state-independent — none branch on recovery/probation/normal. There
     is no separate "recovery decision engine": Recovery Mode only changes POSITION
     SIZING (active_trade_size → RECOVERY_TRADE_SIZE and the in_clawback() ladder
-    cap), never how trades are selected. See USE_RECOVERY_DECISION_ENGINE for the
-    flag that also makes recovery *exit* purely a sizing transition.
+    cap), never how trades are selected. See RECOVERY_KEEP_NORMAL_STAKE for the
+    flag that neutralizes even that sizing effect (recovery becomes telemetry).
     """
     global last_signal_desc
 
@@ -3320,10 +3329,9 @@ def main() -> None:
             # On a real exit, begin the graduated probation ramp instead of
             # snapping straight back to full size (no-op if the ramp is disabled
             # or there is no sub-full room, in which case sizing resumes normal).
-            # USE_RECOVERY_DECISION_ENGINE overrides this: recovery is then a pure
-            # bankroll/position-sizing mode, so on exit the bot returns to its
-            # normal ladder stake IMMEDIATELY — no probation ramp — while still
-            # using the same (already-universal) decision engine.
+            # RECOVERY_KEEP_NORMAL_STAKE makes this a no-op: recovery never
+            # changed the stake, so there is nothing to ramp back — see
+            # resume_after_recovery().
             if recovery.maybe_exit(current_balance):
                 resume_after_recovery()
             run_decision(market, current_balance)

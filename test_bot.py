@@ -1480,34 +1480,69 @@ class TestOnTradeSettledRecoveryEntry:
             lad.on_trade_result(True, 2.0)
         assert lad.get_stake(5.0).multiplier > 1.0        # resumes after 5
 
-    def test_recovery_decision_engine_exit_skips_ladder_pause(self, monkeypatch):
-        """USE_RECOVERY_DECISION_ENGINE makes recovery a pure sizing mode: on
-        exit the ladder is NOT paused, so the bot resumes its normal ladder stake
-        immediately (a hot ladder can size up on the very next trade)."""
+    def test_keep_normal_stake_no_size_drop_in_recovery(self, monkeypatch):
+        """RECOVERY_KEEP_NORMAL_STAKE: while recovery is active the stake stays on
+        the NORMAL ladder size instead of dropping to RECOVERY_TRADE_SIZE."""
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.probation.cancel()
+        bot.recovery.active = True
+        bot.recovery.target_balance = 10_000.0
+        # Default (flag OFF) drops to recovery size.
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
+        assert bot.active_trade_size() == 100.0
+        # Flag ON keeps the normal stake even though recovery is active.
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", True)
+        assert bot.active_trade_size() == 500.0
+        assert bot.recovery.active is True                # still tracking recovery
+
+    def test_keep_normal_stake_lifts_ladder_clawback_cap(self, monkeypatch):
+        """RECOVERY_KEEP_NORMAL_STAKE: recovery no longer forces the in_clawback
+        1x ladder cap, so a hot ladder can size up during recovery."""
         from ladder import StakeLadder, LadderConfig
         self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "USE_RECOVERY_DECISION_ENGINE", True)
         lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=5,
                                            window=20, cooldown_secs=0))
         monkeypatch.setattr(bot, "stake_ladder", lad)
+        for _ in range(9):
+            lad.on_trade_result(True, 2.0)
+        bot.recovery.active = True
+        bot.recovery.target_balance = 10_000.0
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
+        assert bot.in_clawback() is True                  # recovery caps the ladder
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", True)
+        assert bot.in_clawback() is False                 # cap lifted by the flag
+
+    def test_keep_normal_stake_exit_skips_probation_and_pause(self, monkeypatch):
+        """RECOVERY_KEEP_NORMAL_STAKE: the stake never dropped, so exiting recovery
+        starts NO probation ramp and pauses NO ladder size-up — sizing carries on
+        unchanged. Recovery still exits on its existing balance rule."""
+        from ladder import StakeLadder, LadderConfig
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", True)
         monkeypatch.setattr(bot, "RECOVERY_LADDER_PAUSE_TRADES", 5)
-        # Hot record → the ladder would size up if not paused.
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=5,
+                                           window=20, cooldown_secs=0))
+        monkeypatch.setattr(bot, "stake_ladder", lad)
         for _ in range(9):
             lad.on_trade_result(True, 2.0)
         assert lad.get_stake(5.0).multiplier > 1.0
 
+        bot.probation.cancel()
         bot.recovery.active = True
         bot.recovery.target_balance = 10_000.0
-        assert bot.recovery.maybe_exit(10_000.0) is True
-        assert bot.recovery.active is False               # exits on the same rules
-        # No pause engaged: the hot ladder is free to size up immediately.
-        assert lad.get_stake(5.0).multiplier > 1.0
+        assert bot.recovery.maybe_exit(10_000.0) is True  # exits on the same rules
+        assert bot.recovery.active is False
+        bot.resume_after_recovery()
+        assert bot.probation.active is False              # no ramp
+        assert lad.get_stake(5.0).multiplier > 1.0        # no size-up pause
 
-    def test_resume_after_recovery_starts_probation_when_flag_off(self, monkeypatch):
-        """Default (flag OFF): exiting recovery begins the graduated probation
-        ramp, so sizing does NOT snap straight back to full."""
+    def test_keep_normal_stake_off_preserves_probation_ramp(self, monkeypatch):
+        """Default (flag OFF): exiting recovery still begins the graduated
+        probation ramp — existing behavior is untouched."""
         self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "USE_RECOVERY_DECISION_ENGINE", False)
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
         monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
         monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
         monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
@@ -1515,19 +1550,6 @@ class TestOnTradeSettledRecoveryEntry:
         bot.resume_after_recovery()
         assert bot.probation.active is True
         assert bot.active_trade_size() < 500.0            # sub-full ramp base
-
-    def test_resume_after_recovery_immediate_normal_when_flag_on(self, monkeypatch):
-        """Flag ON: exiting recovery is a no-op for position management — no
-        probation ramp — so the bot resumes its normal ladder stake immediately."""
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "USE_RECOVERY_DECISION_ENGINE", True)
-        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
-        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
-        bot.probation.cancel()
-        bot.recovery.active = False
-        bot.resume_after_recovery()
-        assert bot.probation.active is False              # no ramp
-        assert bot.active_trade_size() == 500.0           # full normal stake now
 
 
 # ═════════════════════════════════════════════════════════════════════════════
