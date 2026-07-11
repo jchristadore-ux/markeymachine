@@ -1480,6 +1480,115 @@ class TestOnTradeSettledRecoveryEntry:
             lad.on_trade_result(True, 2.0)
         assert lad.get_stake(5.0).multiplier > 1.0        # resumes after 5
 
+    def test_keep_normal_stake_no_size_drop_in_recovery(self, monkeypatch):
+        """RECOVERY_KEEP_NORMAL_STAKE: while recovery is active the stake stays on
+        the NORMAL ladder size instead of dropping to RECOVERY_TRADE_SIZE."""
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.probation.cancel()
+        bot.recovery.active = True
+        bot.recovery.target_balance = 10_000.0
+        # Default (flag OFF) drops to recovery size.
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
+        assert bot.active_trade_size() == 100.0
+        # Flag ON keeps the normal stake even though recovery is active.
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", True)
+        assert bot.active_trade_size() == 500.0
+        assert bot.recovery.active is True                # still tracking recovery
+
+    def test_keep_normal_stake_lifts_ladder_clawback_cap(self, monkeypatch):
+        """RECOVERY_KEEP_NORMAL_STAKE: recovery no longer forces the in_clawback
+        1x ladder cap, so a hot ladder can size up during recovery."""
+        from ladder import StakeLadder, LadderConfig
+        self._no_telegram(monkeypatch)
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=5,
+                                           window=20, cooldown_secs=0))
+        monkeypatch.setattr(bot, "stake_ladder", lad)
+        for _ in range(9):
+            lad.on_trade_result(True, 2.0)
+        bot.recovery.active = True
+        bot.recovery.target_balance = 10_000.0
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
+        assert bot.in_clawback() is True                  # recovery caps the ladder
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", True)
+        assert bot.in_clawback() is False                 # cap lifted by the flag
+
+    def test_keep_normal_stake_exit_skips_probation_and_pause(self, monkeypatch):
+        """RECOVERY_KEEP_NORMAL_STAKE: the stake never dropped, so exiting recovery
+        starts NO probation ramp and pauses NO ladder size-up — sizing carries on
+        unchanged. Recovery still exits on its existing balance rule."""
+        from ladder import StakeLadder, LadderConfig
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", True)
+        monkeypatch.setattr(bot, "RECOVERY_LADDER_PAUSE_TRADES", 5)
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=5,
+                                           window=20, cooldown_secs=0))
+        monkeypatch.setattr(bot, "stake_ladder", lad)
+        for _ in range(9):
+            lad.on_trade_result(True, 2.0)
+        assert lad.get_stake(5.0).multiplier > 1.0
+
+        bot.probation.cancel()
+        bot.recovery.active = True
+        bot.recovery.target_balance = 10_000.0
+        assert bot.recovery.maybe_exit(10_000.0) is True  # exits on the same rules
+        assert bot.recovery.active is False
+        bot.resume_after_recovery()
+        assert bot.probation.active is False              # no ramp
+        assert lad.get_stake(5.0).multiplier > 1.0        # no size-up pause
+
+    def test_keep_normal_stake_off_preserves_probation_ramp(self, monkeypatch):
+        """Default (flag OFF): exiting recovery still begins the graduated
+        probation ramp — existing behavior is untouched."""
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "PROBATION_RUNGS_RAW", "")
+        bot.probation.cancel()
+        bot.resume_after_recovery()
+        assert bot.probation.active is True
+        assert bot.active_trade_size() < 500.0            # sub-full ramp base
+
+    def test_keep_normal_stake_messages_report_no_change(self, monkeypatch):
+        """The activation/exit notifications must report exactly what happens:
+        recovery triggered, stake unchanged. They must NOT claim a size switch
+        to RECOVERY_TRADE_SIZE, and must state the real (variable) normal base."""
+        sent = []
+        monkeypatch.setattr(bot.tg, "send_telegram_message",
+                            lambda m, *a, **k: sent.append(m) or True)
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", True)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 250.0)   # base from the var
+        rs = bot.RecoveryState(path="unused.json", persist=False)
+
+        assert rs.enter(target_balance=10_000.0, current_balance=9_500.0) is True
+        enter_msg = sent[-1]
+        assert "$250.00" in enter_msg                       # real normal base
+        assert "$100.00" not in enter_msg                   # never the recovery size
+        assert "tracking only" in enter_msg.lower()
+
+        assert rs.maybe_exit(10_000.0) is True
+        exit_msg = sent[-1]
+        assert "$250.00" in exit_msg
+        assert "$100.00" not in exit_msg
+        assert "nothing changed" in exit_msg.lower()
+
+    def test_off_mode_messages_unchanged(self, monkeypatch):
+        """Default (flag OFF): the existing two-tier messages are preserved —
+        activation still reports the switch to RECOVERY_TRADE_SIZE."""
+        sent = []
+        monkeypatch.setattr(bot.tg, "send_telegram_message",
+                            lambda m, *a, **k: sent.append(m) or True)
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 250.0)
+        rs = bot.RecoveryState(path="unused.json", persist=False)
+        assert rs.enter(target_balance=10_000.0, current_balance=9_500.0) is True
+        assert "$100.00" in sent[-1]                        # switch to recovery size
+        assert "ACTIVATED" in sent[-1]
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PROBATION RAMP (post-recovery graduated re-entry — 2026-06-29 log-review fix)

@@ -441,6 +441,36 @@ KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
 RECOVERY_STATE_PATH = os.environ.get("RECOVERY_STATE_PATH", "recovery_state.json")
 RECOVERY_PERSIST    = _env_bool("RECOVERY_PERSIST", True)
 
+# ── Recovery as a sizing-neutral (telemetry-only) state (owner directive) ──────
+# WHY (owner observation): the book trades noticeably better while in Recovery
+# Mode and often gives the gains back once recovery clears and the stake ladders
+# back up. The premise was that Recovery uses a *different trade-evaluation
+# engine*.
+#
+# THE ACTUAL ARCHITECTURE (audit): the trade DECISION engine is ALREADY
+# universal. run_decision() and every gate it calls (expiry/spread/cooldown/
+# daily-loss/streak/session-quality/regime/order-book/momentum/win-prob/
+# confidence/price/edge/kelly) are entirely state-independent — none branch on
+# recovery. `recovery.active` ONLY ever changes POSITION SIZING: it drops the
+# stake to RECOVERY_TRADE_SIZE (active_trade_size), pins the laddering overlay at
+# 1× (in_clawback), and on exit runs a graduated probation ramp + a ladder
+# size-up pause. So the ONLY thing that differs across the recovery boundary is
+# how much is risked — never how trades are selected.
+#
+# WHAT THIS FLAG DOES: when ON, entering Recovery Mode does NOT change any
+# staking. Recovery still activates, tracks its target, logs, and exits on its
+# existing rules — it just becomes telemetry-only for sizing. Concretely, while
+# the flag is ON:
+#   • the stake stays at the NORMAL ladder size (no drop to RECOVERY_TRADE_SIZE),
+#   • the laddering overlay is NOT clawback-capped by recovery,
+#   • on exit there is NO probation ramp and NO ladder size-up pause,
+# so the bot sizes identically whether or not it is "in recovery". When OFF the
+# bot behaves exactly as it does today (two-tier recovery sizing + probation
+# ramp on exit). This flag governs SIZING only; recovery entry/exit accounting
+# (the "recovery"-tagged trade, the target = pre-loss balance, the exit at
+# target) is unchanged either way.
+RECOVERY_KEEP_NORMAL_STAKE = _env_bool("RECOVERY_KEEP_NORMAL_STAKE", False)
+
 
 # ── Laddering stake overlay (opt-in) ──────────────────────────────────────────
 # Scales the Kelly stake by a performance-driven multiplier (0.5x–2x). Disabled
@@ -889,15 +919,30 @@ class RecoveryState:
         self.active         = True
         self.target_balance = round(float(target_balance), 2)
         self._save()
-        log.warning("Recovery mode ACTIVATED after losing full-size trade.")
-        log.warning("Previous balance: $%.2f", self.target_balance)
-        log.warning("Recovery target: $%.2f", self.target_balance)
-        log.warning("Switching trade size to: $%.2f", RECOVERY_TRADE_SIZE)
-        tg.send_telegram_message(
-            f"🛟 RECOVERY MODE ACTIVATED\n"
-            f"Recovery target: ${self.target_balance:.2f}\n"
-            f"Trade size → ${RECOVERY_TRADE_SIZE:.2f} (was ${NORMAL_TRADE_SIZE:.2f})"
-        )
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            # Sizing-neutral mode: report exactly what happens — recovery is
+            # triggered and tracked, but NOTHING about sizing changes.
+            log.warning("Recovery mode TRIGGERED (tracking only — "
+                        "RECOVERY_KEEP_NORMAL_STAKE).")
+            log.warning("Recovery target: $%.2f", self.target_balance)
+            log.warning("Stake UNCHANGED at normal base $%.2f; laddering "
+                        "unchanged.", NORMAL_TRADE_SIZE)
+            tg.send_telegram_message(
+                f"🛟 RECOVERY MODE TRIGGERED (tracking only)\n"
+                f"Recovery target: ${self.target_balance:.2f}\n"
+                f"Everything stays the same — stake remains "
+                f"${NORMAL_TRADE_SIZE:.2f} and existing laddering is unchanged."
+            )
+        else:
+            log.warning("Recovery mode ACTIVATED after losing full-size trade.")
+            log.warning("Previous balance: $%.2f", self.target_balance)
+            log.warning("Recovery target: $%.2f", self.target_balance)
+            log.warning("Switching trade size to: $%.2f", RECOVERY_TRADE_SIZE)
+            tg.send_telegram_message(
+                f"🛟 RECOVERY MODE ACTIVATED\n"
+                f"Recovery target: ${self.target_balance:.2f}\n"
+                f"Trade size → ${RECOVERY_TRADE_SIZE:.2f} (was ${NORMAL_TRADE_SIZE:.2f})"
+            )
         return True
 
     def maybe_exit(self, current_balance: float) -> bool:
@@ -913,6 +958,17 @@ class RecoveryState:
         self._save()
         log.warning("Recovery target reached.")
         log.warning("Recovery mode DEACTIVATED.")
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            # Sizing-neutral mode: the stake never changed, so there is nothing to
+            # switch back and no ladder pause to apply. Report it plainly.
+            log.warning("Stake was UNCHANGED throughout at normal base $%.2f; "
+                        "laddering unchanged.", NORMAL_TRADE_SIZE)
+            tg.send_telegram_message(
+                f"✅ RECOVERY COMPLETE — balance ${current_balance:.2f} ≥ target "
+                f"${reached:.2f}\nNothing changed — stake stayed at "
+                f"${NORMAL_TRADE_SIZE:.2f} and existing laddering was unchanged."
+            )
+            return True
         log.warning("Switching trade size back to: $%.2f", NORMAL_TRADE_SIZE)
         msg = (f"✅ RECOVERY COMPLETE — balance ${current_balance:.2f} ≥ target "
                f"${reached:.2f}\nTrade size → ${NORMAL_TRADE_SIZE:.2f}")
@@ -942,11 +998,22 @@ class RecoveryState:
                      "exiting recovery.", current_balance, self.target_balance)
             self.maybe_exit(current_balance)
             return
-        log.warning("Recovery boot │ RESUMING recovery. Balance $%.2f, target "
-                    "$%.2f, trade size $%.2f.",
-                    current_balance, self.target_balance, RECOVERY_TRADE_SIZE)
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            log.warning("Recovery boot │ RESUMING recovery (tracking only). "
+                        "Balance $%.2f, target $%.2f, stake UNCHANGED at normal "
+                        "base $%.2f.",
+                        current_balance, self.target_balance, NORMAL_TRADE_SIZE)
+        else:
+            log.warning("Recovery boot │ RESUMING recovery. Balance $%.2f, target "
+                        "$%.2f, trade size $%.2f.",
+                        current_balance, self.target_balance, RECOVERY_TRADE_SIZE)
 
     def status_line(self, current_balance: float) -> str:
+        if RECOVERY_KEEP_NORMAL_STAKE:
+            return (f"Recovery mode active (tracking only). Current balance: "
+                    f"${current_balance:.2f}. Target: ${self.target_balance:.2f}. "
+                    f"Stake: ${NORMAL_TRADE_SIZE:.2f} (unchanged); laddering "
+                    f"unchanged.")
         return (f"Recovery mode active. Current balance: ${current_balance:.2f}. "
                 f"Target: ${self.target_balance:.2f}. "
                 f"Trade size: ${RECOVERY_TRADE_SIZE:.2f}.")
@@ -1213,6 +1280,21 @@ class ProbationState:
 probation = ProbationState(PROBATION_STATE_PATH, PROBATION_PERSIST)
 
 
+def resume_after_recovery() -> None:
+    """Position-management transition, run once when recovery clears.
+
+    Normally this begins the graduated probation ramp so the base climbs back to
+    full size instead of snapping there (no-op if the ramp is disabled or there
+    is no sub-full room, in which case sizing resumes normal). Under
+    RECOVERY_KEEP_NORMAL_STAKE the stake never dropped in the first place, so
+    there is nothing to ramp back up: this is a no-op and the ladder simply
+    carries on at its normal size.
+    """
+    if RECOVERY_KEEP_NORMAL_STAKE:
+        return
+    probation.start(_probation_rungs(), NORMAL_TRADE_SIZE)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPORARY HARD STAKE OVERRIDE  (owner directive — manual ramp to $5k)
 #
@@ -1457,7 +1539,11 @@ def active_trade_size(balance: "float | None" = None) -> float:
     temp_override.check_balance(balance)
     if temp_override.active:
         return temp_override.current_size()
-    if recovery.active:
+    # RECOVERY_KEEP_NORMAL_STAKE makes recovery sizing-neutral: skip the drop to
+    # RECOVERY_TRADE_SIZE so the stake stays on the normal ladder. Recovery is
+    # still active (it tracks/logs/exits normally) — it just no longer resizes.
+    # Probation is cancelled on recovery entry, so this falls through to NORMAL.
+    if recovery.active and not RECOVERY_KEEP_NORMAL_STAKE:
         size = RECOVERY_TRADE_SIZE
     elif probation.active:
         size = probation.current_size()
@@ -1471,8 +1557,13 @@ def in_clawback() -> bool:
     TEMP override is pinning the stake. In this state the laddering overlay is
     capped at the active base — it may size DOWN but never UP — so a win rate
     earned at small stakes cannot re-arm full size, and the override's hard
-    stake cannot be scaled past its hardcoded value."""
-    return recovery.active or probation.active or temp_override.active
+    stake cannot be scaled past its hardcoded value.
+
+    RECOVERY_KEEP_NORMAL_STAKE makes recovery sizing-neutral, so recovery no
+    longer contributes the clawback cap: the ladder behaves exactly as it does
+    in normal mode while recovery is active (probation/override still cap)."""
+    recovery_clawback = recovery.active and not RECOVERY_KEEP_NORMAL_STAKE
+    return recovery_clawback or probation.active or temp_override.active
 
 
 def on_trade_settled(won: bool, trade_rec: dict, current_balance: float) -> None:
@@ -2872,6 +2963,16 @@ def write_status_snapshot(balance: float) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_decision(market: dict, balance: float) -> None:
+    """The single, universal trade DECISION engine.
+
+    Every gate below (expiry, spread, cooldown, daily-loss, streak, session
+    quality, regime, order book, momentum, win-prob, confidence, price, edge,
+    Kelly) is state-independent — none branch on recovery/probation/normal. There
+    is no separate "recovery decision engine": Recovery Mode only changes POSITION
+    SIZING (active_trade_size → RECOVERY_TRADE_SIZE and the in_clawback() ladder
+    cap), never how trades are selected. See RECOVERY_KEEP_NORMAL_STAKE for the
+    flag that neutralizes even that sizing effect (recovery becomes telemetry).
+    """
     global last_signal_desc
 
     ticker  = market["ticker"]
@@ -3156,8 +3257,10 @@ def main() -> None:
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
     log.info("  Momentum lookback=%d intervals | thresh≥%.2f%% or R²≥%.2f",
              MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
-    log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
-             NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
+    log.info("  Sizing: normal=$%.0f recovery=$%.0f%s | active=$%.0f%s",
+             NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE,
+             " (tracking-only: stake stays normal)" if RECOVERY_KEEP_NORMAL_STAKE else "",
+             active_trade_size(),
              " (TEMP override, hard stake $%.0f → retires at $%.0f)"
              % (temp_override.current_size(), TEMP_OVERRIDE_EXIT_BALANCE)
              if temp_override.active else
@@ -3261,8 +3364,11 @@ def main() -> None:
             # On a real exit, begin the graduated probation ramp instead of
             # snapping straight back to full size (no-op if the ramp is disabled
             # or there is no sub-full room, in which case sizing resumes normal).
+            # RECOVERY_KEEP_NORMAL_STAKE makes this a no-op: recovery never
+            # changed the stake, so there is nothing to ramp back — see
+            # resume_after_recovery().
             if recovery.maybe_exit(current_balance):
-                probation.start(_probation_rungs(), NORMAL_TRADE_SIZE)
+                resume_after_recovery()
             run_decision(market, current_balance)
             write_status_snapshot(current_balance)
 
