@@ -1633,18 +1633,18 @@ class TestRecoveryWinRateStepUp:
         assert rs.stepup_active() is True
         assert bot.active_trade_size() == 250.0  # full normal on the next entry
 
-    def test_reverts_when_winrate_falls_back(self, monkeypatch):
+    def test_latches_and_holds_when_winrate_falls_back(self, monkeypatch):
+        """Once armed, the step-up LATCHES: the full stake holds for the rest of
+        recovery even after the recovery win rate drops well under the threshold."""
         rs = self._armed_recovery(monkeypatch)
-        for _ in range(4):
+        for _ in range(4):                        # 4/4 = 100% → latch on
             rs.record_result(True, self._REC)
+        assert rs.stepup_active() is True
         assert bot.active_trade_size() == 250.0
-        rs.record_result(False, self._REC)       # 4/5 = 80% > 65%
-        assert bot.active_trade_size() == 250.0
-        rs.record_result(False, self._REC)       # 4/6 = 66.7% > 65%
-        assert bot.active_trade_size() == 250.0
-        rs.record_result(False, self._REC)       # 4/7 = 57.1% <= 65% → revert
-        assert rs.stepup_active() is False
-        assert bot.active_trade_size() == 100.0
+        for _ in range(6):                        # 4/10 = 40% ≪ 65% — stays latched
+            rs.record_result(False, self._REC)
+        assert rs.stepup_active() is True
+        assert bot.active_trade_size() == 250.0   # still full — no revert
 
     def test_only_recovery_tagged_trades_count(self, monkeypatch):
         rs = self._armed_recovery(monkeypatch)
@@ -1656,13 +1656,15 @@ class TestRecoveryWinRateStepUp:
 
     def test_boundary_is_strict_greater_than(self, monkeypatch):
         rs = self._armed_recovery(monkeypatch)
-        # Exactly 65% (13/20) must NOT step up — the gate is strictly greater.
-        for _ in range(13):
-            rs.record_result(True, self._REC)
+        # Losses first, then wins, so the running win rate climbs toward 65% from
+        # below and only ever REACHES exactly 65% (13/20) on the final trade — it
+        # never exceeds it, so the strict-`>` gate never latches.
         for _ in range(7):
             rs.record_result(False, self._REC)
+        for _ in range(13):
+            rs.record_result(True, self._REC)
         assert (rs.period_wins, rs.period_losses) == (13, 7)
-        assert rs.stepup_active() is False
+        assert rs.stepup_active() is False        # exactly 65% is not > 65%
         assert bot.active_trade_size() == 100.0
 
     def test_disabled_by_default(self, monkeypatch):
@@ -1684,8 +1686,9 @@ class TestRecoveryWinRateStepUp:
         for _ in range(4):
             rs.record_result(True, self._REC)
         assert rs.stepup_active() is True
-        rs.maybe_exit(10_000.0)                   # exit clears the window
+        rs.maybe_exit(10_000.0)                   # exit clears the window + latch
         assert rs.period_wins == 0 and rs.period_losses == 0
+        assert rs.stepped_up is False
         rs.enter(target_balance=11_000.0, current_balance=10_500.0)
         assert rs.stepup_active() is False        # fresh window, reduced size
         assert bot.active_trade_size() == 100.0
@@ -1700,9 +1703,10 @@ class TestRecoveryWinRateStepUp:
         rs.enter(target_balance=10_000.0, current_balance=9_500.0)
         for _ in range(4):
             rs.record_result(True, self._REC)
-        # Reload from disk → the recovery-period window is restored.
+        # Reload from disk → the recovery-period window AND the latch are restored.
         rs2 = bot.RecoveryState(path=p, persist=True)
         assert (rs2.period_wins, rs2.period_losses) == (4, 0)
+        assert rs2.stepped_up is True
         assert rs2.stepup_active() is True
 
 
