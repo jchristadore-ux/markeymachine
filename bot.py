@@ -478,12 +478,13 @@ RECOVERY_KEEP_NORMAL_STAKE = _env_bool("RECOVERY_KEEP_NORMAL_STAKE", False)
 # over the trades taken SINCE recovery began exceeds RECOVERY_STEPUP_WINRATE
 # (measured only once at least RECOVERY_STEPUP_MIN_TRADES recovery trades have
 # settled — so a 1-for-1 start cannot trip it), the NEXT entry sizes at the full
-# NORMAL_TRADE_SIZE instead of RECOVERY_TRADE_SIZE. It is re-evaluated on every
-# recovery settlement: the stake steps back down to RECOVERY_TRADE_SIZE if the
-# recovery win rate later falls back to/under the threshold. Recovery entry/exit
-# accounting (target, exit-at-target, no re-arm while active) is unchanged — this
-# only affects the in-recovery stake. No effect when RECOVERY_KEEP_NORMAL_STAKE
-# is ON (the stake is already normal) or while the TEMP override preempts sizing.
+# NORMAL_TRADE_SIZE instead of RECOVERY_TRADE_SIZE. The step-up LATCHES: once the
+# win rate first clears the threshold the full stake holds for the rest of that
+# recovery, even if the win rate later dips (it resets only when recovery exits).
+# Recovery entry/exit accounting (target, exit-at-target, no re-arm while active)
+# is unchanged — this only affects the in-recovery stake. No effect when
+# RECOVERY_KEEP_NORMAL_STAKE is ON (the stake is already normal) or while the
+# TEMP override preempts sizing.
 RECOVERY_WINRATE_STEPUP    = _env_bool("RECOVERY_WINRATE_STEPUP", False)
 RECOVERY_STEPUP_WINRATE    = _env_float("RECOVERY_STEPUP_WINRATE", 0.65)
 RECOVERY_STEPUP_MIN_TRADES = _env_int("RECOVERY_STEPUP_MIN_TRADES", 4)
@@ -917,9 +918,12 @@ class RecoveryState:
         self.target_balance: float = 0.0
         # Recovery-period W/L: settled trades taken since this recovery began,
         # used by the win-rate step-up. Reset on every entry, persisted so a
-        # mid-recovery restart keeps the running count.
+        # mid-recovery restart keeps the running count. `stepped_up` LATCHES on
+        # the first time the win rate clears the threshold and stays on until
+        # recovery exits (persisted so a restart doesn't drop it).
         self.period_wins:    int   = 0
         self.period_losses:  int   = 0
+        self.stepped_up:     bool  = False
         self._path    = path
         self._persist = persist
         if self._persist:
@@ -940,9 +944,10 @@ class RecoveryState:
             return False
         self.active         = True
         self.target_balance = round(float(target_balance), 2)
-        # Fresh recovery → fresh win-rate window for the step-up.
+        # Fresh recovery → fresh win-rate window and un-latched step-up.
         self.period_wins    = 0
         self.period_losses  = 0
+        self.stepped_up     = False
         self._save()
         if RECOVERY_KEEP_NORMAL_STAKE:
             # Sizing-neutral mode: report exactly what happens — recovery is
@@ -982,6 +987,7 @@ class RecoveryState:
         self.target_balance = 0.0
         self.period_wins    = 0
         self.period_losses  = 0
+        self.stepped_up     = False
         self._save()
         log.warning("Recovery target reached.")
         log.warning("Recovery mode DEACTIVATED.")
@@ -1015,45 +1021,55 @@ class RecoveryState:
 
         Only trades ENTERED in recovery (mode_at_entry == "recovery") while
         recovery is active count — the full-size loss that armed recovery, and
-        any pre-recovery trade settling late, do not. Announces the step-up the
-        first time a qualifying win rate arms it. No-op unless the feature is on."""
+        any pre-recovery trade settling late, do not. The step-up LATCHES: the
+        first time the recovery win rate clears the threshold it turns on and
+        STAYS on for the rest of this recovery, even if the win rate later dips.
+        No-op unless the feature is on."""
         if not (RECOVERY_WINRATE_STEPUP and self.active):
             return
         if (trade_rec or {}).get("mode_at_entry") != "recovery":
             return
-        was_armed = self.stepup_active()
         if won:
             self.period_wins += 1
         else:
             self.period_losses += 1
+        newly_latched = not self.stepped_up and self._winrate_qualifies()
+        if newly_latched:
+            self.stepped_up = True
         self._save()
-        if self.stepup_active() and not was_armed:
+        if newly_latched:
             total = self.period_wins + self.period_losses
             wr    = self.period_wins / total if total else 0.0
-            log.warning("Recovery win-rate step-up ARMED │ WR=%.0f%% (%d/%d) > "
-                        "%.0f%% → next entry sizes at $%.2f (was $%.2f).",
+            log.warning("Recovery win-rate step-up LATCHED │ WR=%.0f%% (%d/%d) > "
+                        "%.0f%% → stake steps to $%.2f (was $%.2f) and holds "
+                        "until recovery completes.",
                         wr * 100, self.period_wins, total,
                         RECOVERY_STEPUP_WINRATE * 100,
                         NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE)
             tg.send_telegram_message(
-                f"📈 RECOVERY STEP-UP\n"
+                f"📈 RECOVERY STEP-UP (latched)\n"
                 f"Recovery win rate {wr*100:.0f}% ({self.period_wins}/{total}) "
-                f"> {RECOVERY_STEPUP_WINRATE*100:.0f}% — next trade sizes at "
-                f"${NORMAL_TRADE_SIZE:.2f} (up from ${RECOVERY_TRADE_SIZE:.2f})."
+                f"> {RECOVERY_STEPUP_WINRATE*100:.0f}% — stake steps up to "
+                f"${NORMAL_TRADE_SIZE:.2f} (from ${RECOVERY_TRADE_SIZE:.2f}) and "
+                f"stays there until recovery completes."
             )
 
-    def stepup_active(self) -> bool:
-        """True when the recovery win-rate step-up condition is currently met, so
-        the in-recovery stake should be the full NORMAL_TRADE_SIZE. Re-evaluated
-        every settlement: it drops back to False if the recovery win rate later
-        falls to/under the threshold. Requires at least RECOVERY_STEPUP_MIN_TRADES
-        settled recovery trades so a tiny sample cannot trip it."""
-        if not (RECOVERY_WINRATE_STEPUP and self.active):
-            return False
+    def _winrate_qualifies(self) -> bool:
+        """Raw gate: at least RECOVERY_STEPUP_MIN_TRADES settled recovery trades
+        AND the recovery win rate strictly exceeds RECOVERY_STEPUP_WINRATE. Used
+        once to latch the step-up (a tiny sample cannot trip it)."""
         total = self.period_wins + self.period_losses
         if total < RECOVERY_STEPUP_MIN_TRADES:
             return False
         return (self.period_wins / total) > RECOVERY_STEPUP_WINRATE
+
+    def stepup_active(self) -> bool:
+        """True while the LATCHED win-rate step-up is in effect, so the
+        in-recovery stake is the full NORMAL_TRADE_SIZE. Latches on the first time
+        the recovery win rate clears RECOVERY_STEPUP_WINRATE (after at least
+        RECOVERY_STEPUP_MIN_TRADES settled recovery trades) and stays on — it does
+        NOT drop back if the win rate later dips — until recovery exits."""
+        return bool(RECOVERY_WINRATE_STEPUP and self.active and self.stepped_up)
 
     def reconcile_on_boot(self, current_balance: float) -> None:
         """Self-heal persisted state at startup so the bot can never resume into
@@ -1110,6 +1126,7 @@ class RecoveryState:
                     "target_balance": self.target_balance,
                     "period_wins":    self.period_wins,
                     "period_losses":  self.period_losses,
+                    "stepped_up":     self.stepped_up,
                 }, f)
             os.replace(tmp, self._path)   # atomic on POSIX
         except OSError as e:
@@ -1125,6 +1142,7 @@ class RecoveryState:
         self.target_balance = float(d.get("target_balance", 0.0) or 0.0)
         self.period_wins    = int(d.get("period_wins", 0) or 0)
         self.period_losses  = int(d.get("period_losses", 0) or 0)
+        self.stepped_up     = bool(d.get("stepped_up", False))
 
 
 recovery = RecoveryState(RECOVERY_STATE_PATH, RECOVERY_PERSIST)
