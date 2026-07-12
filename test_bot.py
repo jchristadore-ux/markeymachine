@@ -1591,6 +1591,122 @@ class TestOnTradeSettledRecoveryEntry:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# RECOVERY WIN-RATE STEP-UP (owner directive — size back to full on a strong WR)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestRecoveryWinRateStepUp:
+    """While recovery has cut the stake to RECOVERY_TRADE_SIZE, a strong recovery
+    win rate (> threshold, over a min sample) sizes the next entry back to full
+    NORMAL_TRADE_SIZE. Re-evaluated every settlement; off by default."""
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def _armed_recovery(self, monkeypatch):
+        """A fresh, active RecoveryState wired as the module singleton, with the
+        step-up enabled at 65% / min-4 and sizes 100→250."""
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_WINRATE_STEPUP", True)
+        monkeypatch.setattr(bot, "RECOVERY_STEPUP_WINRATE", 0.65)
+        monkeypatch.setattr(bot, "RECOVERY_STEPUP_MIN_TRADES", 4)
+        monkeypatch.setattr(bot, "RECOVERY_KEEP_NORMAL_STAKE", False)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 250.0)
+        rs = bot.RecoveryState(path="unused.json", persist=False)
+        rs.enter(target_balance=10_000.0, current_balance=9_500.0)
+        monkeypatch.setattr(bot, "recovery", rs)
+        return rs
+
+    _REC = {"mode_at_entry": "recovery"}
+
+    def test_below_min_trades_stays_reduced(self, monkeypatch):
+        rs = self._armed_recovery(monkeypatch)
+        for _ in range(3):                       # 3 wins, total < min 4
+            rs.record_result(True, self._REC)
+        assert rs.stepup_active() is False
+        assert bot.active_trade_size() == 100.0
+
+    def test_steps_up_to_full_on_strong_winrate(self, monkeypatch):
+        rs = self._armed_recovery(monkeypatch)
+        for _ in range(4):                       # 4/4 = 100% > 65%
+            rs.record_result(True, self._REC)
+        assert rs.stepup_active() is True
+        assert bot.active_trade_size() == 250.0  # full normal on the next entry
+
+    def test_reverts_when_winrate_falls_back(self, monkeypatch):
+        rs = self._armed_recovery(monkeypatch)
+        for _ in range(4):
+            rs.record_result(True, self._REC)
+        assert bot.active_trade_size() == 250.0
+        rs.record_result(False, self._REC)       # 4/5 = 80% > 65%
+        assert bot.active_trade_size() == 250.0
+        rs.record_result(False, self._REC)       # 4/6 = 66.7% > 65%
+        assert bot.active_trade_size() == 250.0
+        rs.record_result(False, self._REC)       # 4/7 = 57.1% <= 65% → revert
+        assert rs.stepup_active() is False
+        assert bot.active_trade_size() == 100.0
+
+    def test_only_recovery_tagged_trades_count(self, monkeypatch):
+        rs = self._armed_recovery(monkeypatch)
+        for _ in range(6):                       # 6 normal-tagged wins: ignored
+            rs.record_result(True, {"mode_at_entry": "normal"})
+        assert rs.period_wins == 0 and rs.period_losses == 0
+        assert rs.stepup_active() is False
+        assert bot.active_trade_size() == 100.0
+
+    def test_boundary_is_strict_greater_than(self, monkeypatch):
+        rs = self._armed_recovery(monkeypatch)
+        # Exactly 65% (13/20) must NOT step up — the gate is strictly greater.
+        for _ in range(13):
+            rs.record_result(True, self._REC)
+        for _ in range(7):
+            rs.record_result(False, self._REC)
+        assert (rs.period_wins, rs.period_losses) == (13, 7)
+        assert rs.stepup_active() is False
+        assert bot.active_trade_size() == 100.0
+
+    def test_disabled_by_default(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_WINRATE_STEPUP", False)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 250.0)
+        rs = bot.RecoveryState(path="unused.json", persist=False)
+        rs.enter(target_balance=10_000.0, current_balance=9_500.0)
+        monkeypatch.setattr(bot, "recovery", rs)
+        for _ in range(10):                      # perfect record, feature off
+            rs.record_result(True, self._REC)
+        assert rs.period_wins == 0               # not even tracked when off
+        assert rs.stepup_active() is False
+        assert bot.active_trade_size() == 100.0
+
+    def test_resets_on_new_recovery(self, monkeypatch):
+        rs = self._armed_recovery(monkeypatch)
+        for _ in range(4):
+            rs.record_result(True, self._REC)
+        assert rs.stepup_active() is True
+        rs.maybe_exit(10_000.0)                   # exit clears the window
+        assert rs.period_wins == 0 and rs.period_losses == 0
+        rs.enter(target_balance=11_000.0, current_balance=10_500.0)
+        assert rs.stepup_active() is False        # fresh window, reduced size
+        assert bot.active_trade_size() == 100.0
+
+    def test_stepup_survives_persistence_roundtrip(self, monkeypatch, tmp_path):
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "RECOVERY_WINRATE_STEPUP", True)
+        monkeypatch.setattr(bot, "RECOVERY_STEPUP_WINRATE", 0.65)
+        monkeypatch.setattr(bot, "RECOVERY_STEPUP_MIN_TRADES", 4)
+        p = str(tmp_path / "rec.json")
+        rs = bot.RecoveryState(path=p, persist=True)
+        rs.enter(target_balance=10_000.0, current_balance=9_500.0)
+        for _ in range(4):
+            rs.record_result(True, self._REC)
+        # Reload from disk → the recovery-period window is restored.
+        rs2 = bot.RecoveryState(path=p, persist=True)
+        assert (rs2.period_wins, rs2.period_losses) == (4, 0)
+        assert rs2.stepup_active() is True
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PROBATION RAMP (post-recovery graduated re-entry — 2026-06-29 log-review fix)
 # ═════════════════════════════════════════════════════════════════════════════
 
