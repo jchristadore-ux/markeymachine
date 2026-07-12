@@ -471,6 +471,23 @@ RECOVERY_PERSIST    = _env_bool("RECOVERY_PERSIST", True)
 # target) is unchanged either way.
 RECOVERY_KEEP_NORMAL_STAKE = _env_bool("RECOVERY_KEEP_NORMAL_STAKE", False)
 
+# ── Recovery win-rate step-up (owner directive) ────────────────────────────────
+# While recovery has reduced the stake to RECOVERY_TRADE_SIZE, a strong recovery
+# win rate means the edge is clearly working — so there is no reason to keep
+# risking the small size. When RECOVERY_WINRATE_STEPUP is ON and the win rate
+# over the trades taken SINCE recovery began exceeds RECOVERY_STEPUP_WINRATE
+# (measured only once at least RECOVERY_STEPUP_MIN_TRADES recovery trades have
+# settled — so a 1-for-1 start cannot trip it), the NEXT entry sizes at the full
+# NORMAL_TRADE_SIZE instead of RECOVERY_TRADE_SIZE. It is re-evaluated on every
+# recovery settlement: the stake steps back down to RECOVERY_TRADE_SIZE if the
+# recovery win rate later falls back to/under the threshold. Recovery entry/exit
+# accounting (target, exit-at-target, no re-arm while active) is unchanged — this
+# only affects the in-recovery stake. No effect when RECOVERY_KEEP_NORMAL_STAKE
+# is ON (the stake is already normal) or while the TEMP override preempts sizing.
+RECOVERY_WINRATE_STEPUP    = _env_bool("RECOVERY_WINRATE_STEPUP", False)
+RECOVERY_STEPUP_WINRATE    = _env_float("RECOVERY_STEPUP_WINRATE", 0.65)
+RECOVERY_STEPUP_MIN_TRADES = _env_int("RECOVERY_STEPUP_MIN_TRADES", 4)
+
 
 # ── Laddering stake overlay (opt-in) ──────────────────────────────────────────
 # Scales the Kelly stake by a performance-driven multiplier (0.5x–2x). Disabled
@@ -898,6 +915,11 @@ class RecoveryState:
     def __init__(self, path: str, persist: bool) -> None:
         self.active:         bool  = False
         self.target_balance: float = 0.0
+        # Recovery-period W/L: settled trades taken since this recovery began,
+        # used by the win-rate step-up. Reset on every entry, persisted so a
+        # mid-recovery restart keeps the running count.
+        self.period_wins:    int   = 0
+        self.period_losses:  int   = 0
         self._path    = path
         self._persist = persist
         if self._persist:
@@ -918,6 +940,9 @@ class RecoveryState:
             return False
         self.active         = True
         self.target_balance = round(float(target_balance), 2)
+        # Fresh recovery → fresh win-rate window for the step-up.
+        self.period_wins    = 0
+        self.period_losses  = 0
         self._save()
         if RECOVERY_KEEP_NORMAL_STAKE:
             # Sizing-neutral mode: report exactly what happens — recovery is
@@ -955,6 +980,8 @@ class RecoveryState:
         reached = self.target_balance
         self.active         = False
         self.target_balance = 0.0
+        self.period_wins    = 0
+        self.period_losses  = 0
         self._save()
         log.warning("Recovery target reached.")
         log.warning("Recovery mode DEACTIVATED.")
@@ -981,6 +1008,52 @@ class RecoveryState:
                     f"{RECOVERY_LADDER_PAUSE_TRADES} trades.")
         tg.send_telegram_message(msg)
         return True
+
+    # ── recovery win-rate step-up ─────────────────────────────────────────────
+    def record_result(self, won: bool, trade_rec: dict) -> None:
+        """Feed one settled trade into the recovery-period win-rate window.
+
+        Only trades ENTERED in recovery (mode_at_entry == "recovery") while
+        recovery is active count — the full-size loss that armed recovery, and
+        any pre-recovery trade settling late, do not. Announces the step-up the
+        first time a qualifying win rate arms it. No-op unless the feature is on."""
+        if not (RECOVERY_WINRATE_STEPUP and self.active):
+            return
+        if (trade_rec or {}).get("mode_at_entry") != "recovery":
+            return
+        was_armed = self.stepup_active()
+        if won:
+            self.period_wins += 1
+        else:
+            self.period_losses += 1
+        self._save()
+        if self.stepup_active() and not was_armed:
+            total = self.period_wins + self.period_losses
+            wr    = self.period_wins / total if total else 0.0
+            log.warning("Recovery win-rate step-up ARMED │ WR=%.0f%% (%d/%d) > "
+                        "%.0f%% → next entry sizes at $%.2f (was $%.2f).",
+                        wr * 100, self.period_wins, total,
+                        RECOVERY_STEPUP_WINRATE * 100,
+                        NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE)
+            tg.send_telegram_message(
+                f"📈 RECOVERY STEP-UP\n"
+                f"Recovery win rate {wr*100:.0f}% ({self.period_wins}/{total}) "
+                f"> {RECOVERY_STEPUP_WINRATE*100:.0f}% — next trade sizes at "
+                f"${NORMAL_TRADE_SIZE:.2f} (up from ${RECOVERY_TRADE_SIZE:.2f})."
+            )
+
+    def stepup_active(self) -> bool:
+        """True when the recovery win-rate step-up condition is currently met, so
+        the in-recovery stake should be the full NORMAL_TRADE_SIZE. Re-evaluated
+        every settlement: it drops back to False if the recovery win rate later
+        falls to/under the threshold. Requires at least RECOVERY_STEPUP_MIN_TRADES
+        settled recovery trades so a tiny sample cannot trip it."""
+        if not (RECOVERY_WINRATE_STEPUP and self.active):
+            return False
+        total = self.period_wins + self.period_losses
+        if total < RECOVERY_STEPUP_MIN_TRADES:
+            return False
+        return (self.period_wins / total) > RECOVERY_STEPUP_WINRATE
 
     def reconcile_on_boot(self, current_balance: float) -> None:
         """Self-heal persisted state at startup so the bot can never resume into
@@ -1014,9 +1087,15 @@ class RecoveryState:
                     f"${current_balance:.2f}. Target: ${self.target_balance:.2f}. "
                     f"Stake: ${NORMAL_TRADE_SIZE:.2f} (unchanged); laddering "
                     f"unchanged.")
+        stepped = self.stepup_active()
+        size    = NORMAL_TRADE_SIZE if stepped else RECOVERY_TRADE_SIZE
+        total   = self.period_wins + self.period_losses
+        wr_note = (f" Recovery WR {self.period_wins}/{total}"
+                   f"{' — step-up ACTIVE' if stepped else ''}."
+                   if RECOVERY_WINRATE_STEPUP and total else "")
         return (f"Recovery mode active. Current balance: ${current_balance:.2f}. "
                 f"Target: ${self.target_balance:.2f}. "
-                f"Trade size: ${RECOVERY_TRADE_SIZE:.2f}.")
+                f"Trade size: ${size:.2f}.{wr_note}")
 
     # ── persistence (atomic JSON write) ────────────────────────────────────────
     def _save(self) -> None:
@@ -1029,6 +1108,8 @@ class RecoveryState:
                     "schema":         self.SCHEMA,
                     "active":         self.active,
                     "target_balance": self.target_balance,
+                    "period_wins":    self.period_wins,
+                    "period_losses":  self.period_losses,
                 }, f)
             os.replace(tmp, self._path)   # atomic on POSIX
         except OSError as e:
@@ -1042,6 +1123,8 @@ class RecoveryState:
             return
         self.active         = bool(d.get("active", False))
         self.target_balance = float(d.get("target_balance", 0.0) or 0.0)
+        self.period_wins    = int(d.get("period_wins", 0) or 0)
+        self.period_losses  = int(d.get("period_losses", 0) or 0)
 
 
 recovery = RecoveryState(RECOVERY_STATE_PATH, RECOVERY_PERSIST)
@@ -1544,7 +1627,10 @@ def active_trade_size(balance: "float | None" = None) -> float:
     # still active (it tracks/logs/exits normally) — it just no longer resizes.
     # Probation is cancelled on recovery entry, so this falls through to NORMAL.
     if recovery.active and not RECOVERY_KEEP_NORMAL_STAKE:
-        size = RECOVERY_TRADE_SIZE
+        # Win-rate step-up: a strong recovery win rate sizes the next entry at the
+        # full NORMAL_TRADE_SIZE instead of RECOVERY_TRADE_SIZE (re-evaluated every
+        # settlement — see RecoveryState.stepup_active / RECOVERY_WINRATE_STEPUP).
+        size = NORMAL_TRADE_SIZE if recovery.stepup_active() else RECOVERY_TRADE_SIZE
     elif probation.active:
         size = probation.current_size()
     else:
@@ -2426,6 +2512,8 @@ def resolve_open_orders() -> None:
             # trade's recorded pre-trade balance as the target). paper_balance is
             # already updated above for this settlement.
             on_trade_settled(won, trade, paper_balance)
+            # Recovery win-rate step-up: feed the recovery-period W/L window.
+            recovery.record_result(won, trade)
             # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
             probation_record(won, trade, paper_balance)
             # TEMP override hook: feed the manual win-streak ramp / exit check.
@@ -2554,6 +2642,8 @@ def resolve_open_orders() -> None:
             # Recovery ENTRY hook: `balance` was fetched (realized) above for
             # this settled trade.
             on_trade_settled(won, trade, balance)
+            # Recovery win-rate step-up: feed the recovery-period W/L window.
+            recovery.record_result(won, trade)
             # Probation RAMP hook: a probation-mode trade advances/steps the ramp.
             probation_record(won, trade, balance)
             # TEMP override hook: feed the manual win-streak ramp / exit check.
@@ -3257,9 +3347,12 @@ def main() -> None:
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
     log.info("  Momentum lookback=%d intervals | thresh≥%.2f%% or R²≥%.2f",
              MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
-    log.info("  Sizing: normal=$%.0f recovery=$%.0f%s | active=$%.0f%s",
+    log.info("  Sizing: normal=$%.0f recovery=$%.0f%s%s | active=$%.0f%s",
              NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE,
              " (tracking-only: stake stays normal)" if RECOVERY_KEEP_NORMAL_STAKE else "",
+             " (WR step-up ≥%.0f%% after %d → $%.0f)"
+             % (RECOVERY_STEPUP_WINRATE * 100, RECOVERY_STEPUP_MIN_TRADES, NORMAL_TRADE_SIZE)
+             if RECOVERY_WINRATE_STEPUP and not RECOVERY_KEEP_NORMAL_STAKE else "",
              active_trade_size(),
              " (TEMP override, hard stake $%.0f → retires at $%.0f)"
              % (temp_override.current_size(), TEMP_OVERRIDE_EXIT_BALANCE)
