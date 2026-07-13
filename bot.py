@@ -1,7 +1,36 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.9.0  —  Production Build                                  ║
+║  MARKEYMACHINE  v9.10.0  —  Production Build                                 ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.10.0 — PROFIT LOCK + TRADE WINDOW (2026-07-13 give-back fix)             ║
+║  2026-07-13: +$553 (+60.2%) banked by 10:00 UTC on the 4:30/5:00/6:00am ET   ║
+║  markets, then three ~$220 losses on the 8:00/9:15/10:45am ET markets gave   ║
+║  it ALL back (trough −$106 on the day). A 15:15 UTC container restart then   ║
+║  wiped the in-memory daily P&L (PnL=$0, WR=0/0). Two independent gates:      ║
+║                                                                              ║
+║  1. PROFIT LOCK — halts NEW entries for the rest of the UTC day when the     ║
+║     day's REALIZED P&L (paper_daily_pnl / live_daily_realized — never an     ║
+║     open-position mark, the v9.3.1 phantom-loss lesson) either               ║
+║       (a) hits PROFIT_LOCK_TARGET_PCT (40%) of session-start balance, or    ║
+║       (b) after the day's peak arms the trail at PROFIT_LOCK_ARM_PCT (15%), ║
+║           gives back PROFIT_LOCK_GIVEBACK_PCT (30%) of that peak.           ║
+║     Open positions still settle; heartbeats/dashboard keep running; the     ║
+║     lock auto-clears at UTC rollover. State {day, peak, realized, locked}   ║
+║     persists to PROFIT_LOCK_STATE_PATH (atomic JSON, same pattern as        ║
+║     recovery) so a mid-day restart can never silently unlock it — put it    ║
+║     on a /data volume for real durability. Replay of 07-13: hard target     ║
+║     locks the day at +$553; trailing alone locks at +$333; actual was +$81. ║
+║                                                                              ║
+║  2. TRADE WINDOW — hard entry window in exchange-local time, default        ║
+║     TRADE_WINDOW="04:00-07:30" TRADE_WINDOW_TZ=America/New_York (tickers    ║
+║     are ET and the edge is an ET-session phenomenon, so it tracks DST).     ║
+║     All three 07-13 wins were 4:30–6:00am ET markets; all three losses      ║
+║     were 8:00am+. ANDed with session quality — narrows, never widens. Set   ║
+║     TRADE_WINDOW="" to disable. 1–4am ET stays closed (session-quality      ║
+║     scores 30–50 < 60): zero data there — widen deliberately, not by        ║
+║     default. RAILWAY: PROFIT_LOCK_TARGET_PCT / PROFIT_LOCK_ARM_PCT /        ║
+║     PROFIT_LOCK_GIVEBACK_PCT / PROFIT_LOCK_STATE_PATH / TRADE_WINDOW.       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.9.0 — PERF-GUARD DEADLOCK FIX (de-rate, don't hard-block)                ║
 ║  DIAGNOSIS (2026-07-03→06 logs, ZERO trades for ~2.6 days): the statistical  ║
@@ -306,7 +335,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.9.0"
+BOT_VERSION = "9.10.0"
 
 import base64
 import json
@@ -322,6 +351,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Optional, Set, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -684,6 +714,35 @@ SESSION_QUALITY: dict = {
 }
 MIN_SESSION_SCORE = _env_int("MIN_SESSION_SCORE", 60)
 
+# ── Profit lock (daily profit protection — v9.10.0) ───────────────────────────
+# When the day's REALIZED P&L spikes and then starts decaying, stop entering:
+# a locked day keeps its wins. Two triggers, one lock (see the header banner
+# and PROFIT_PROTECTION_PLAN.md for the 2026-07-13 case that motivated it).
+# The lock blocks NEW entries only and clears itself at the UTC rollover.
+PROFIT_LOCK_ENABLED      = _env_bool("PROFIT_LOCK_ENABLED", True)
+# Hard take-profit: lock when daily realized P&L ≥ this fraction of the
+# session-start balance. 0 disables the hard-target trigger.
+PROFIT_LOCK_TARGET_PCT   = _env_float("PROFIT_LOCK_TARGET_PCT", 0.40)
+# Trailing give-back: once the day's realized-P&L PEAK reaches ARM_PCT of the
+# session-start balance the trail is armed; lock when P&L then falls to or
+# below peak × (1 − GIVEBACK_PCT). ARM_PCT=0 disables the trailing trigger.
+PROFIT_LOCK_ARM_PCT      = _env_float("PROFIT_LOCK_ARM_PCT", 0.15)
+PROFIT_LOCK_GIVEBACK_PCT = _env_float("PROFIT_LOCK_GIVEBACK_PCT", 0.30)
+# Same persistence contract as RECOVERY_STATE_PATH: survives an in-container
+# restart; mount a Railway Volume (e.g. /data/profit_lock_state.json) to also
+# survive redeploys. The 2026-07-13 15:15 restart is why this exists.
+PROFIT_LOCK_STATE_PATH   = os.environ.get("PROFIT_LOCK_STATE_PATH", "profit_lock_state.json")
+PROFIT_LOCK_PERSIST      = _env_bool("PROFIT_LOCK_PERSIST", True)
+
+# ── Trade window (target session — v9.10.0) ───────────────────────────────────
+# Hard clock window for NEW entries, "HH:MM-HH:MM" in TRADE_WINDOW_TZ (an IANA
+# zone — exchange-local ET by default so the window tracks DST; market tickers
+# encode close times in ET). ANDed with the session-quality gate: the window
+# can only narrow trading hours, never open hours session quality blocks.
+# Overnight windows ("22:00-04:00") wrap midnight. Empty string = disabled.
+TRADE_WINDOW    = os.environ.get("TRADE_WINDOW", "04:00-07:30").strip()
+TRADE_WINDOW_TZ = os.environ.get("TRADE_WINDOW_TZ", "America/New_York")
+
 # ── Time-of-day learned prior (per-bucket Bayesian calibration) ───────────────
 # WHY (2026-06-29 log review + 4-day pattern): the bot runs ONE strategy —
 # short-dated trend-continuation — and trend persistence is time-of-day
@@ -869,6 +928,12 @@ recovery_entered_ts:   float        = 0.0
 _session_start_ts:     str          = ""
 _session_day:          str          = ""
 _session_halted:       bool         = False
+# v9.10.0 profit lock: the day's realized-P&L peak, the lock flag, and the
+# same-day realized P&L restored from disk after a restart (the daily
+# accumulators above are in-memory and zero on every boot).
+daily_pnl_peak:        float        = 0.0
+_profit_locked:        bool         = False
+_pl_realized_offset:   float        = 0.0
 _shutdown_requested:   bool         = False
 _last_known_balance:   float        = 0.0
 
@@ -2518,6 +2583,8 @@ def resolve_open_orders() -> None:
             probation_record(won, trade, paper_balance)
             # TEMP override hook: feed the manual win-streak ramp / exit check.
             temp_override_record(won, paper_balance)
+            # Profit lock: advance the day's realized-P&L peak / trip the lock.
+            update_profit_lock(paper_balance)
 
             log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
                      ticker[-15:], side, result.upper(), sim, paper_balance)
@@ -2648,6 +2715,8 @@ def resolve_open_orders() -> None:
             probation_record(won, trade, balance)
             # TEMP override hook: feed the manual win-streak ramp / exit check.
             temp_override_record(won, balance)
+            # Profit lock: advance the day's realized-P&L peak / trip the lock.
+            update_profit_lock(balance)
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",
@@ -2785,6 +2854,127 @@ def minutes_to_expiry(market: dict) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROFIT LOCK  (daily profit protection — v9.10.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _profit_lock_realized() -> float:
+    """The day's REALIZED P&L as the profit lock sees it: the in-memory daily
+    accumulator plus any same-day realized restored from disk after a restart.
+    Without the offset, a restart zeroes the accumulator and the trailing
+    trigger would read the reset as a full give-back of the peak."""
+    return _pl_realized_offset + (paper_daily_pnl if DEMO_MODE else live_daily_realized)
+
+
+def _profit_lock_save() -> None:
+    if not PROFIT_LOCK_PERSIST:
+        return
+    try:
+        tmp = f"{PROFIT_LOCK_STATE_PATH}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({
+                "schema":   1,
+                "day":      datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "peak":     round(daily_pnl_peak, 2),
+                "realized": round(_profit_lock_realized(), 2),
+                "locked":   _profit_locked,
+            }, f)
+        os.replace(tmp, PROFIT_LOCK_STATE_PATH)   # atomic on POSIX
+    except OSError as e:
+        log.warning("Profit lock │ state save failed: %s", e)
+
+
+def profit_lock_load_on_boot() -> None:
+    """Restore same-day profit-lock state after a restart, so a redeploy can
+    never silently unlock a locked day (2026-07-13 15:15: a restart wiped
+    +$553 of banked daily P&L from memory). Stale-day state is discarded —
+    the lock is strictly a per-UTC-day mechanism."""
+    global daily_pnl_peak, _profit_locked, _pl_realized_offset
+    if not PROFIT_LOCK_PERSIST:
+        return
+    try:
+        with open(PROFIT_LOCK_STATE_PATH) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return
+    if d.get("day") != datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+        return
+    daily_pnl_peak      = float(d.get("peak", 0.0) or 0.0)
+    _pl_realized_offset = float(d.get("realized", 0.0) or 0.0)
+    _profit_locked      = bool(d.get("locked", False))
+    if _profit_locked or daily_pnl_peak != 0.0:
+        log.info("Profit lock boot │ restored same-day state: peak $%+.2f, "
+                 "realized $%+.2f%s", daily_pnl_peak, _pl_realized_offset,
+                 " — LOCKED for the day" if _profit_locked else "")
+
+
+def update_profit_lock(balance: float) -> None:
+    """Advance the day's realized-P&L peak and trip the lock when either
+    trigger fires. Called once per SETTLED trade from both resolution paths —
+    realized dollars only, so an open position's outlay can never trip it
+    (the v9.3.1 phantom-loss class)."""
+    global daily_pnl_peak, _profit_locked
+    if not PROFIT_LOCK_ENABLED:
+        return
+    realized = _profit_lock_realized()
+    if realized > daily_pnl_peak:
+        daily_pnl_peak = realized
+    base = session_start_balance
+    if _profit_locked or base <= 0.0:
+        _profit_lock_save()
+        return
+
+    trigger = ""
+    if PROFIT_LOCK_TARGET_PCT > 0 and realized >= PROFIT_LOCK_TARGET_PCT * base:
+        trigger = (f"hard target — daily P&L ${realized:+.2f} ≥ "
+                   f"{PROFIT_LOCK_TARGET_PCT * 100:.0f}% of ${base:.2f} start")
+    elif (PROFIT_LOCK_ARM_PCT > 0
+          and daily_pnl_peak >= PROFIT_LOCK_ARM_PCT * base
+          and realized <= daily_pnl_peak * (1.0 - PROFIT_LOCK_GIVEBACK_PCT)):
+        trigger = (f"trailing give-back — daily P&L ${realized:+.2f} fell to "
+                   f"≤{(1.0 - PROFIT_LOCK_GIVEBACK_PCT) * 100:.0f}% of peak "
+                   f"${daily_pnl_peak:+.2f}")
+
+    if trigger:
+        _profit_locked = True
+        log.warning("🔒 PROFIT LOCK │ %s │ new entries halted until UTC rollover.",
+                    trigger)
+        telegram_profit_lock(realized, daily_pnl_peak, balance, trigger)
+    _profit_lock_save()
+
+
+# ── Trade window parsing (module-level, once) ─────────────────────────────────
+
+def _parse_trade_window(spec: str) -> Optional[Tuple[int, int]]:
+    """Parse "HH:MM-HH:MM" into (start, end) minutes-of-day. Returns None for
+    an empty spec (feature off). An INVALID spec also returns None but logs
+    loudly — a typo must fail open (trade as before), never silently halt."""
+    if not spec:
+        return None
+    try:
+        start_s, end_s = spec.split("-")
+        sh, sm = (int(x) for x in start_s.strip().split(":"))
+        eh, em = (int(x) for x in end_s.strip().split(":"))
+        if not (0 <= sh <= 23 and 0 <= eh <= 23 and 0 <= sm <= 59 and 0 <= em <= 59):
+            raise ValueError(spec)
+        start, end = sh * 60 + sm, eh * 60 + em
+        if start == end:
+            raise ValueError("zero-length window")
+        return (start, end)
+    except (ValueError, AttributeError):
+        log.error("TRADE_WINDOW %r invalid — expected \"HH:MM-HH:MM\". "
+                  "Window gate DISABLED.", spec)
+        return None
+
+
+try:
+    _trade_window_tz = ZoneInfo(TRADE_WINDOW_TZ)
+except Exception:
+    log.error("TRADE_WINDOW_TZ %r unknown — falling back to UTC.", TRADE_WINDOW_TZ)
+    _trade_window_tz = timezone.utc
+_trade_window = _parse_trade_window(TRADE_WINDOW)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GUARD STACK
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2831,6 +3021,29 @@ def session_quality_check() -> bool:
     utc_h = datetime.now(timezone.utc).hour
     if score < MIN_SESSION_SCORE:
         log.info("Session quality │ UTC%d score=%d < %d", utc_h, score, MIN_SESSION_SCORE)
+        return False
+    return True
+
+
+def profit_lock_check() -> bool:
+    if not _profit_locked:
+        return True
+    log.info("Profit lock │ locked (peak $%+.2f) — no new entries today.",
+             daily_pnl_peak)
+    return False
+
+
+def trade_window_check(now: Optional[datetime] = None) -> bool:
+    if _trade_window is None:
+        return True
+    if now is None:
+        now = datetime.now(_trade_window_tz)
+    m = now.hour * 60 + now.minute
+    start, end = _trade_window
+    inside = (start <= m < end) if start < end else (m >= start or m < end)
+    if not inside:
+        log.info("Trade window │ %02d:%02d %s outside %s", now.hour, now.minute,
+                 TRADE_WINDOW_TZ, TRADE_WINDOW)
         return False
     return True
 
@@ -2973,13 +3186,28 @@ def telegram_boot(balance: float) -> None:
         f"OBDepth≥${MIN_OB_DEPTH:.0f} | OBImb≥{OB_IMBALANCE_THRESH*100:.0f}%\n"
         f"AGREE-gate={'ON' if REQUIRE_AGREE_MOMENTUM else 'OFF'} | "
         f"Breakeven≤{YES_BREAKEVEN_PRICE}c\n"
-        f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}"
+        f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}\n"
+        f"ProfitLock={'target +%.0f%%, trail %.0f%%/−%.0f%%' % (PROFIT_LOCK_TARGET_PCT * 100, PROFIT_LOCK_ARM_PCT * 100, PROFIT_LOCK_GIVEBACK_PCT * 100) if PROFIT_LOCK_ENABLED else 'OFF'} | "
+        f"Window={TRADE_WINDOW + ' ' + TRADE_WINDOW_TZ if _trade_window else 'none'}"
     )
 
 
 def telegram_halt(reason: str, balance: float) -> None:
     tg.send_telegram_message(
         f"⛔ HALTED (PERMANENT)\nReason: {reason}\nBalance: ${balance:.2f}"
+    )
+
+
+def telegram_profit_lock(pnl: float, peak: float, balance: float, trigger: str) -> None:
+    base = session_start_balance
+    pct  = pnl / base * 100 if base > 0 else 0.0
+    tg.send_telegram_message(
+        f"🔒 PROFIT LOCKED — done for the day\n"
+        f"Trigger: {trigger}\n"
+        f"Daily P&L: ${pnl:+.2f} ({pct:+.1f}%) │ Peak: ${peak:+.2f}\n"
+        f"Balance: ${balance:.2f}\n"
+        f"New entries paused; open positions settle normally. "
+        f"Auto-resumes at UTC rollover."
     )
 
 
@@ -3037,6 +3265,8 @@ def write_status_snapshot(balance: float) -> None:
             "open_tickers": [o.get("ticker", "") for o in open_orders.values()],
             "session_state": session_state.value,
             "halted": _session_halted,
+            "profit_locked": _profit_locked,
+            "daily_pnl_peak": round(float(daily_pnl_peak), 2),
             "last_signal": last_signal_desc,
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -3087,6 +3317,10 @@ def run_decision(market: dict, balance: float) -> None:
         return
     if not daily_loss_check(balance):
         return
+    # v9.10.0: a profit-locked day takes no new entries — the wins are banked.
+    if not profit_lock_check():
+        last_signal_desc = f"profit locked (${_profit_lock_realized():+.2f})"
+        return
     if not streak_check():
         last_signal_desc = f"streak pause ({consecutive_losses}L)"
         return
@@ -3097,6 +3331,10 @@ def run_decision(market: dict, balance: float) -> None:
     # form shrinks size instead of stopping evaluation entirely.
     if not session_quality_check():
         last_signal_desc = f"session quality UTC{datetime.now(timezone.utc).hour}"
+        return
+    # v9.10.0: hard clock window for entries (exchange-local, DST-aware).
+    if not trade_window_check():
+        last_signal_desc = f"outside trade window {TRADE_WINDOW}"
         return
     if len(open_orders) >= MAX_CONCURRENT_POS:
         log.info("Concurrent │ %d open", len(open_orders))
@@ -3263,6 +3501,7 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     global _session_day, _session_halted, session_start_balance
     global session_stop_threshold, daily_pnl, paper_daily_pnl, consecutive_losses
     global session_state, streak_pause_until, live_daily_realized
+    global daily_pnl_peak, _profit_locked, _pl_realized_offset
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today == _session_day:
@@ -3280,6 +3519,12 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     streak_pause_until     = 0.0
     session_state          = SessionState.ACTIVE
     session_traded_tickers.clear()
+    # v9.10.0: a fresh day unlocks the profit lock and starts a fresh peak.
+    was_profit_locked   = _profit_locked
+    daily_pnl_peak      = 0.0
+    _profit_locked      = False
+    _pl_realized_offset = 0.0
+    _profit_lock_save()
 
     # v9.7.0: a fresh trading day re-enters the slow-roll ramp from the floor
     # ($100 → $250 → $500) so the first trade of the day is small and scales up
@@ -3291,8 +3536,10 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     if not recovery.active:
         probation.start(_probation_rungs(), NORMAL_TRADE_SIZE, reason="Daily slow-roll")
 
-    log.info("🔄 New trading day %s │ balance $%.2f │ daily budget reset%s",
-             today, current_balance, " (halt cleared)" if was_halted else "")
+    log.info("🔄 New trading day %s │ balance $%.2f │ daily budget reset%s%s",
+             today, current_balance,
+             " (halt cleared)" if was_halted else "",
+             " (profit lock cleared)" if was_profit_locked else "")
     return True
 
 
@@ -3363,6 +3610,11 @@ def main() -> None:
              % (probation.current_size(), NORMAL_TRADE_SIZE)
              if probation.active else "")
     log.info("  Kelly=%.2f | SessionScore≥%d", KELLY_FRACTION, MIN_SESSION_SCORE)
+    log.info("  ProfitLock=%s target=%.0f%% arm=%.0f%% giveback=%.0f%% | Window=%s",
+             "ON" if PROFIT_LOCK_ENABLED else "OFF",
+             PROFIT_LOCK_TARGET_PCT * 100, PROFIT_LOCK_ARM_PCT * 100,
+             PROFIT_LOCK_GIVEBACK_PCT * 100,
+             f"{TRADE_WINDOW} {TRADE_WINDOW_TZ}" if _trade_window else "none")
     log.info("  TimePrior: %dh buckets fullN=%d | now=%s prior=%.3f n=%d",
              BUCKET_GROUP_HOURS, BUCKET_PRIOR_FULL_N, bucket_stats.key_now(),
              *bucket_stats.prior_for(bucket_stats.key_now()))
@@ -3373,6 +3625,10 @@ def main() -> None:
     live_wins          = 0
     live_losses        = 0
     streak_pause_until = 0.0
+
+    # v9.10.0: restore same-day profit-lock state (peak / realized / locked)
+    # BEFORE trading starts, so a mid-day restart resumes locked if it locked.
+    profit_lock_load_on_boot()
 
     if DEMO_MODE:
         running_pnl            = 0.0

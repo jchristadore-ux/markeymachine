@@ -45,9 +45,15 @@ A trade is placed **only when all nine layers pass simultaneously**. Every layer
 
 ### Layer 4 — Time Quality
 - [ ] Current UTC hour is **not** in `{0, 1, 2, 3, 4}` (post-US-close thin books)
+- [ ] Current exchange-local time is inside `TRADE_WINDOW` (v9.10.0, default 4:00–7:30am ET — the proven edge window; DST-aware)
 - [ ] At least 3 minutes remaining until market closes
 
-**Rationale:** Near expiry, OB signals reflect resolution certainty rather than directional pressure. Low-liquidity hours produce thin books where 1-2 orders can dominate the OB.
+**Rationale:** Near expiry, OB signals reflect resolution certainty rather than directional pressure. Low-liquidity hours produce thin books where 1-2 orders can dominate the OB. The trade window exists because the edge is time-of-day concentrated (2026-07-13: all wins on 4:30–6:00am ET markets, all losses on 8:00am+ markets — see `PROFIT_PROTECTION_PLAN.md`).
+
+### Layer 4b — Profit Lock (v9.10.0)
+- [ ] The day is not profit-locked: daily **realized** P&L has not hit `PROFIT_LOCK_TARGET_PCT` (40%) of session-start balance, and — once the peak arms the trail at `PROFIT_LOCK_ARM_PCT` (15%) — has not given back `PROFIT_LOCK_GIVEBACK_PCT` (30%) of that peak
+
+**Rationale:** A windfall session that keeps trading tends to give the windfall back (2026-07-13: +60.2% banked by 10:00 UTC, all returned by 15:00). A locked day keeps its wins: new entries stop, open positions settle, and the lock clears at the UTC rollover. Realized dollars only — an open position's outlay can never trip it (v9.3.1 lesson). The lock state persists to disk, so a restart can never silently unlock a locked day.
 
 ### Layer 5 — Market Regime (Regime Detection)
 - [ ] BTC price regime is **TRENDING** (R² > 0.65 on linear regression of last 10 price samples)

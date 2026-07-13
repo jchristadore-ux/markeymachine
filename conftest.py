@@ -40,10 +40,13 @@ def _retire_temp_override():
 
     prev_done    = bot.temp_override.done
     prev_persist = bot.temp_override._persist
+    prev_pl_persist = bot.PROFIT_LOCK_PERSIST
     bot.temp_override._persist = False        # never touch disk during tests
     bot.temp_override.done     = True         # retired → fall through to the ladder
+    bot.PROFIT_LOCK_PERSIST    = False        # profit lock: never touch disk either
     try:
         yield
     finally:
         bot.temp_override.done     = prev_done
         bot.temp_override._persist = prev_persist
+        bot.PROFIT_LOCK_PERSIST    = prev_pl_persist

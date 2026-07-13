@@ -2268,3 +2268,206 @@ class TestTempStakeOverride:
         b = bot.TempStakeOverride(path, persist=True)
         assert b.size == 210.0
         assert b.done is False
+
+
+class TestProfitLock:
+    """v9.10.0 daily profit lock: bank a windfall session instead of giving it
+    back (2026-07-13: +$553 by 10:00 UTC, all returned by 15:00). Realized-only
+    P&L, hard-target + trailing give-back triggers, per-UTC-day, restart-proof."""
+
+    def setup_method(self):
+        self._saved = (bot.PROFIT_LOCK_ENABLED, bot.PROFIT_LOCK_TARGET_PCT,
+                       bot.PROFIT_LOCK_ARM_PCT, bot.PROFIT_LOCK_GIVEBACK_PCT,
+                       bot.session_start_balance, bot.paper_daily_pnl)
+        bot.PROFIT_LOCK_ENABLED      = True
+        bot.PROFIT_LOCK_TARGET_PCT   = 0.40
+        bot.PROFIT_LOCK_ARM_PCT      = 0.15
+        bot.PROFIT_LOCK_GIVEBACK_PCT = 0.30
+        bot.session_start_balance    = 1000.0
+        self._reset_state()
+
+    def teardown_method(self):
+        (bot.PROFIT_LOCK_ENABLED, bot.PROFIT_LOCK_TARGET_PCT,
+         bot.PROFIT_LOCK_ARM_PCT, bot.PROFIT_LOCK_GIVEBACK_PCT,
+         bot.session_start_balance, bot.paper_daily_pnl) = self._saved
+        self._reset_state()
+
+    @staticmethod
+    def _reset_state():
+        bot.paper_daily_pnl     = 0.0
+        bot.daily_pnl_peak      = 0.0
+        bot._profit_locked      = False
+        bot._pl_realized_offset = 0.0
+
+    @staticmethod
+    def _settle(pnl, monkeypatch=None, balance=1000.0):
+        """Simulate one settled paper trade worth `pnl` dollars."""
+        bot.paper_daily_pnl += pnl
+        bot.update_profit_lock(balance)
+
+    def _no_telegram(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    # ── hard target ───────────────────────────────────────────────────────────
+    def test_hard_target_trips_at_threshold(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        self._settle(400.0)                       # 40% of $1000 start
+        assert bot._profit_locked is True
+        assert bot.profit_lock_check() is False
+
+    def test_no_trip_below_target(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        self._settle(399.0)
+        assert bot._profit_locked is False
+        assert bot.profit_lock_check() is True
+
+    # ── trailing give-back ────────────────────────────────────────────────────
+    def test_trailing_arms_then_trips_on_giveback(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        self._settle(200.0)                       # peak $200 ≥ 15% arm
+        assert bot._profit_locked is False
+        self._settle(-61.0)                       # $139 ≤ 70% of $200 ($140)
+        assert bot._profit_locked is True
+
+    def test_trailing_holds_within_giveback_allowance(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        self._settle(200.0)
+        self._settle(-50.0)                       # $150 > $140 floor
+        assert bot._profit_locked is False
+
+    def test_trailing_never_trips_unarmed(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        self._settle(100.0)                       # peak $100 < 15% arm ($150)
+        self._settle(-90.0)                       # deep give-back, but unarmed
+        assert bot._profit_locked is False
+
+    def test_giveback_measured_from_running_peak(self, monkeypatch):
+        # The peak ratchets up with every new high; the floor follows it.
+        self._no_telegram(monkeypatch)
+        self._settle(200.0)
+        self._settle(150.0)                       # peak now $350
+        self._settle(-106.0)                      # $244 ≤ 70% of $350 ($245)
+        assert bot._profit_locked is True
+
+    # ── scope and safety ──────────────────────────────────────────────────────
+    def test_open_position_outlay_cannot_trip(self, monkeypatch):
+        # v9.3.1 class: cash leaving the balance for an OPEN position is not
+        # realized P&L. Only the realized accumulator feeds the lock.
+        self._no_telegram(monkeypatch)
+        self._settle(200.0)                       # armed
+        bot.update_profit_lock(600.0)             # balance dipped, no settlement
+        assert bot._profit_locked is False
+
+    def test_disabled_never_trips(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        bot.PROFIT_LOCK_ENABLED = False
+        self._settle(900.0)
+        assert bot._profit_locked is False
+
+    def test_lock_blocks_only_new_entries(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        self._settle(400.0)
+        assert bot._profit_locked is True
+        # A position settling AFTER the lock still updates the accumulators.
+        self._settle(-100.0)
+        assert bot.paper_daily_pnl == 300.0
+        assert bot._profit_locked is True         # and the lock stays on
+
+    def test_rollover_clears_lock_and_peak(self, monkeypatch):
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "PROBATION_RAMP_ENABLED", False)
+        monkeypatch.setattr(bot, "_session_day", "2000-01-01")
+        self._settle(400.0)
+        assert bot._profit_locked is True
+        assert bot.maybe_roll_session_day(1400.0) is True
+        assert bot._profit_locked is False
+        assert bot.daily_pnl_peak == 0.0
+        assert bot._pl_realized_offset == 0.0
+
+    # ── persistence (restart-proofing) ────────────────────────────────────────
+    def test_persistence_same_day_roundtrip(self, monkeypatch, tmp_path):
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "PROFIT_LOCK_PERSIST", True)
+        monkeypatch.setattr(bot, "PROFIT_LOCK_STATE_PATH",
+                            str(tmp_path / "profit_lock_state.json"))
+        self._settle(400.0)                       # locks and persists
+        self._reset_state()                       # simulate a restart wipe
+        bot.profit_lock_load_on_boot()
+        assert bot._profit_locked is True
+        assert bot.daily_pnl_peak == 400.0
+        assert bot._pl_realized_offset == 400.0
+
+    def test_persistence_restart_preserves_trailing_floor(self, monkeypatch, tmp_path):
+        # Restart mid-day with an armed (unlocked) peak: the realized offset is
+        # restored so the trail measures from the true peak, and the reset
+        # accumulator is not misread as a give-back.
+        self._no_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "PROFIT_LOCK_PERSIST", True)
+        monkeypatch.setattr(bot, "PROFIT_LOCK_STATE_PATH",
+                            str(tmp_path / "profit_lock_state.json"))
+        self._settle(200.0)                       # armed, not locked
+        self._reset_state()
+        bot.profit_lock_load_on_boot()
+        assert bot._profit_locked is False
+        assert bot._pl_realized_offset == 200.0
+        self._settle(-30.0)                       # effective $170 > $140 floor
+        assert bot._profit_locked is False
+        self._settle(-31.0)                       # effective $139 ≤ $140 floor
+        assert bot._profit_locked is True
+
+    def test_persistence_discards_stale_day(self, monkeypatch, tmp_path):
+        import json as _json
+        monkeypatch.setattr(bot, "PROFIT_LOCK_PERSIST", True)
+        path = tmp_path / "profit_lock_state.json"
+        monkeypatch.setattr(bot, "PROFIT_LOCK_STATE_PATH", str(path))
+        path.write_text(_json.dumps({"schema": 1, "day": "2000-01-01",
+                                     "peak": 553.0, "realized": 553.0,
+                                     "locked": True}))
+        bot.profit_lock_load_on_boot()
+        assert bot._profit_locked is False        # yesterday's lock is over
+        assert bot.daily_pnl_peak == 0.0
+
+
+class TestTradeWindow:
+    """v9.10.0 exchange-local entry window. 2026-07-13: all wins were on the
+    4:30-6:00am ET markets, all losses on 8:00am+ — the gate only admits
+    entries inside TRADE_WINDOW and fails open on a bad spec."""
+
+    @staticmethod
+    def _et(hour, minute):
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+        return _dt(2026, 7, 13, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+
+    def test_parse_valid_window(self):
+        assert bot._parse_trade_window("04:00-07:30") == (240, 450)
+
+    def test_parse_empty_disables(self):
+        assert bot._parse_trade_window("") is None
+
+    def test_parse_invalid_fails_open(self):
+        assert bot._parse_trade_window("junk") is None
+        assert bot._parse_trade_window("25:00-07:00") is None
+        assert bot._parse_trade_window("04:00-04:00") is None
+
+    def test_inside_window_passes(self, monkeypatch):
+        monkeypatch.setattr(bot, "_trade_window", (240, 450))   # 04:00-07:30
+        assert bot.trade_window_check(self._et(4, 0)) is True
+        assert bot.trade_window_check(self._et(6, 15)) is True
+        assert bot.trade_window_check(self._et(7, 29)) is True
+
+    def test_outside_window_blocks(self, monkeypatch):
+        monkeypatch.setattr(bot, "_trade_window", (240, 450))
+        assert bot.trade_window_check(self._et(3, 59)) is False
+        assert bot.trade_window_check(self._et(7, 30)) is False  # end-exclusive
+        assert bot.trade_window_check(self._et(10, 45)) is False # 07-13 loss hours
+
+    def test_overnight_window_wraps_midnight(self, monkeypatch):
+        monkeypatch.setattr(bot, "_trade_window", (1320, 240))  # 22:00-04:00
+        assert bot.trade_window_check(self._et(23, 0)) is True
+        assert bot.trade_window_check(self._et(1, 30)) is True
+        assert bot.trade_window_check(self._et(12, 0)) is False
+
+    def test_disabled_window_always_passes(self, monkeypatch):
+        monkeypatch.setattr(bot, "_trade_window", None)
+        assert bot.trade_window_check(self._et(12, 0)) is True

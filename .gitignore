@@ -30,6 +30,8 @@ probation_state.json
 probation_state.json.tmp
 temp_override_state.json
 temp_override_state.json.tmp
+profit_lock_state.json
+profit_lock_state.json.tmp
 bucket_stats.json
 bucket_stats.json.tmp
 status.json
