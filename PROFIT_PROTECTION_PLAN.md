@@ -1,6 +1,9 @@
 # Profit Protection Plan — Daily Profit Lock + Target Trading Window
 
-**Status:** PLAN (not yet implemented)
+**Status:** IMPLEMENTED in v9.10.0 (same branch/PR as this document). One
+deliberate deviation from §3: `TRADE_WINDOW` ships **enabled by default**
+(`04:00-07:30` ET) rather than opt-in via env var, per owner directive that the
+bot "targets" this window every day — set `TRADE_WINDOW=""` to disable.
 **Trigger event:** 2026-07-13 session — +60% by 6:00am ET, fully given back by 11am ET.
 
 ---

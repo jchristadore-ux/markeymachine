@@ -99,6 +99,8 @@ See [`BUSINESS_PLAN.md`](BUSINESS_PLAN.md) for the managed-service model this en
 
 | Control | Behavior |
 |---|---|
+| **Profit lock** *(v9.10.0)* | Banks a windfall day: halts new entries until UTC rollover when daily **realized** P&L hits `PROFIT_LOCK_TARGET_PCT` (40%) of session-start balance, or — once the day's peak arms the trail at `PROFIT_LOCK_ARM_PCT` (15%) — gives back `PROFIT_LOCK_GIVEBACK_PCT` (30%) of that peak. Open positions still settle; state persists across restarts. See [`PROFIT_PROTECTION_PLAN.md`](PROFIT_PROTECTION_PLAN.md) |
+| **Trade window** *(v9.10.0)* | New entries only inside `TRADE_WINDOW` (default `04:00-07:30` `America/New_York`, DST-aware) — the proven edge window. ANDed with session quality. Empty string disables |
 | **Recovery mode** *(v9.5.0)* | After a full-size loss, drops to `RECOVERY_TRADE_SIZE` until balance recovers to the pre-loss level, then auto-resumes `NORMAL_TRADE_SIZE`. Persistent across restarts |
 | **Streak filter** *(only active auto-hold)* | After `MAX_CONSEC_LOSSES` (3) consecutive losses, pauses trading for `STREAK_PAUSE_SECS` then resets the counter |
 | Session stop *(catastrophic backstop)* | Halts if balance drops below `SESSION_STOP_FRACTION` (40%) of session-start balance |
@@ -208,6 +210,14 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `PROBATION_RUNG_STEP` | `250` | *(v9.8.0)* Dollar step for the auto-built ramp ladder (floor → … → `NORMAL_TRADE_SIZE`) |
 | `MAX_BET_FRACTION` | `1.0` | **Dead config (v9.4.1)** — flat sizing ignores it |
 | `SESSION_STOP_FRACTION` | `0.40` | Catastrophic backstop — halt below this fraction of session-start balance |
+| `PROFIT_LOCK_ENABLED` | `true` | *(v9.10.0)* Master switch for the daily profit lock |
+| `PROFIT_LOCK_TARGET_PCT` | `0.40` | *(v9.10.0)* Hard take-profit: lock the day when daily realized P&L ≥ this fraction of session-start balance. `0` disables this trigger |
+| `PROFIT_LOCK_ARM_PCT` | `0.15` | *(v9.10.0)* The trailing lock arms once the day's realized-P&L peak reaches this fraction of session-start balance. `0` disables the trailing trigger |
+| `PROFIT_LOCK_GIVEBACK_PCT` | `0.30` | *(v9.10.0)* Once armed, lock when daily P&L falls to ≤ peak × (1 − this). Default keeps ≥70% of the peak |
+| `PROFIT_LOCK_STATE_PATH` | `profit_lock_state.json` | *(v9.10.0)* Lock state `{day, peak, realized, locked}`. Point at a Railway **Volume** (e.g. `/data/profit_lock_state.json`) to survive redeploys — a restart must never unlock a locked day |
+| `PROFIT_LOCK_PERSIST` | `true` | *(v9.10.0)* Set `false` to disable profit-lock persistence |
+| `TRADE_WINDOW` | `04:00-07:30` | *(v9.10.0)* Entry window `HH:MM-HH:MM` in `TRADE_WINDOW_TZ`. End-exclusive; overnight windows (`22:00-04:00`) wrap midnight. Empty string disables |
+| `TRADE_WINDOW_TZ` | `America/New_York` | *(v9.10.0)* IANA zone for `TRADE_WINDOW` — exchange-local ET by default so the window tracks DST |
 | `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |
 | `KELLY_FRACTION` | `0.30` | v9.4.1: only gates edge (`>0`); no longer scales stake size |
 | `MAX_CONSEC_LOSSES` | `3` | Streak pause threshold — the only active auto-hold |
