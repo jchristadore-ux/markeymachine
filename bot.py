@@ -1,7 +1,25 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  MARKEYMACHINE  v9.10.0  —  Production Build                                 ║
+║  MARKEYMACHINE  v9.11.0  —  Production Build                                 ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.11.0 — DAILY GOAL LADDER (2026-07-14 keep-grinding fix)                  ║
+║  The real objective is COMPOUNDING — bank ≥3%/day (DAILY_MIN_TARGET_PCT) and ║
+║  let it ride. v9.10.0's window HARD-STOPPED the day at 07:30 ET even if the  ║
+║  morning banked nothing, so a slow morning = a wasted day = no compounding.  ║
+║  Two coupled gates fix it, both ON by default:                               ║
+║   1. WINDOW_EXTEND_UNTIL_GOAL — after the window closes the bot KEEPS trading║
+║      until the day is profit-locked (goal met), instead of going dark on the ║
+║      clock. The profit lock, not the clock, now ends the day.               ║
+║   2. DAILY_TARGET_LADDER_ENABLED — after the window the effective lock target║
+║      LADDERS DOWN from PROFIT_LOCK_TARGET_PCT (40%) toward DAILY_MIN_TARGET_ ║
+║      PCT (3%) over DAILY_TARGET_DECAY_HOURS (8h). Aim big in the golden      ║
+║      window; bank progressively smaller (never <3%) gains as the day wears   ║
+║      on rather than chasing 40% into the give-back zone. The v9.10.0         ║
+║      trailing give-back trap still protects any peak in between.             ║
+║   RAILWAY: WINDOW_EXTEND_UNTIL_GOAL, DAILY_TARGET_LADDER_ENABLED,           ║
+║   DAILY_MIN_TARGET_PCT, DAILY_TARGET_DECAY_HOURS. Set the first two false   ║
+║   to restore the v9.10.0 hard window + flat target.                         ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.10.0 — PROFIT LOCK + TRADE WINDOW (2026-07-13 give-back fix)             ║
 ║  2026-07-13: +$553 (+60.2%) banked by 10:00 UTC on the 4:30/5:00/6:00am ET   ║
@@ -335,7 +353,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.10.0"
+BOT_VERSION = "9.11.0"
 
 import base64
 import json
@@ -720,8 +738,11 @@ MIN_SESSION_SCORE = _env_int("MIN_SESSION_SCORE", 60)
 # and PROFIT_PROTECTION_PLAN.md for the 2026-07-13 case that motivated it).
 # The lock blocks NEW entries only and clears itself at the UTC rollover.
 PROFIT_LOCK_ENABLED      = _env_bool("PROFIT_LOCK_ENABLED", True)
-# Hard take-profit: lock when daily realized P&L ≥ this fraction of the
-# session-start balance. 0 disables the hard-target trigger.
+# Take-profit STRETCH target: lock when daily realized P&L ≥ this fraction of
+# the session-start balance. 0 disables the hard-target trigger. v9.11.0: this
+# is the target held during the golden window; after the window it ladders DOWN
+# toward DAILY_MIN_TARGET_PCT (see the Daily goal ladder block below and
+# _effective_profit_target_pct).
 PROFIT_LOCK_TARGET_PCT   = _env_float("PROFIT_LOCK_TARGET_PCT", 0.40)
 # Trailing give-back: once the day's realized-P&L PEAK reaches ARM_PCT of the
 # session-start balance the trail is armed; lock when P&L then falls to or
@@ -742,6 +763,35 @@ PROFIT_LOCK_PERSIST      = _env_bool("PROFIT_LOCK_PERSIST", True)
 # Overnight windows ("22:00-04:00") wrap midnight. Empty string = disabled.
 TRADE_WINDOW    = os.environ.get("TRADE_WINDOW", "04:00-07:30").strip()
 TRADE_WINDOW_TZ = os.environ.get("TRADE_WINDOW_TZ", "America/New_York")
+
+# ── Daily goal ladder — keep grinding past the window (v9.11.0) ────────────────
+# The bot's real objective is COMPOUNDING: bank at least DAILY_MIN_TARGET_PCT
+# (3%) every day and let it compound. PROFIT_LOCK_TARGET_PCT (40%) is the STRETCH
+# target we aim for in the golden morning window, where the 2026-07-13 evidence
+# says wins come easiest. v9.10.0 fixed give-back (a big morning handed back);
+# the owner's follow-up concern (2026-07-14) is the OPPOSITE failure — a morning
+# that closes SHORT of target and then goes dark for the day, banking nothing and
+# never compounding. Two coupled changes address it:
+#
+#   1. WINDOW_EXTEND_UNTIL_GOAL — the trade window no longer hard-STOPS the day.
+#      Inside the window we trade as before; once it closes we KEEP trading as
+#      long as the day is not yet profit-locked (i.e. the goal is still unmet),
+#      instead of going dark on the clock. The profit lock — not the clock — is
+#      now what ends the day. Set false to restore the v9.10.0 hard window.
+#
+#   2. DAILY_TARGET_LADDER_ENABLED — after the window closes the effective
+#      profit-lock target LADDERS DOWN from PROFIT_LOCK_TARGET_PCT toward
+#      DAILY_MIN_TARGET_PCT over DAILY_TARGET_DECAY_HOURS. Early it holds out for
+#      the big 40%; as the day wears on it accepts progressively less, floored at
+#      the 3% compounding minimum — so a day that can't print 40% still banks
+#      what it can rather than grinding into the give-back zone forever. The
+#      trailing give-back trap (PROFIT_LOCK_ARM_PCT / _GIVEBACK_PCT) still
+#      protects any peak that forms between the floor and the target. Set false
+#      to keep a flat PROFIT_LOCK_TARGET_PCT all day (v9.10.0 behaviour).
+WINDOW_EXTEND_UNTIL_GOAL    = _env_bool("WINDOW_EXTEND_UNTIL_GOAL", True)
+DAILY_TARGET_LADDER_ENABLED = _env_bool("DAILY_TARGET_LADDER_ENABLED", True)
+DAILY_MIN_TARGET_PCT        = _env_float("DAILY_MIN_TARGET_PCT", 0.03)
+DAILY_TARGET_DECAY_HOURS    = _env_float("DAILY_TARGET_DECAY_HOURS", 8.0)
 
 # ── Time-of-day learned prior (per-bucket Bayesian calibration) ───────────────
 # WHY (2026-06-29 log review + 4-day pattern): the bot runs ONE strategy —
@@ -2924,9 +2974,11 @@ def update_profit_lock(balance: float) -> None:
         return
 
     trigger = ""
-    if PROFIT_LOCK_TARGET_PCT > 0 and realized >= PROFIT_LOCK_TARGET_PCT * base:
-        trigger = (f"hard target — daily P&L ${realized:+.2f} ≥ "
-                   f"{PROFIT_LOCK_TARGET_PCT * 100:.0f}% of ${base:.2f} start")
+    target_pct = _effective_profit_target_pct()
+    if target_pct > 0 and realized >= target_pct * base:
+        laddered = "" if target_pct >= PROFIT_LOCK_TARGET_PCT - 1e-9 else " (laddered)"
+        trigger = (f"daily target{laddered} — daily P&L ${realized:+.2f} ≥ "
+                   f"{target_pct * 100:.0f}% of ${base:.2f} start")
     elif (PROFIT_LOCK_ARM_PCT > 0
           and daily_pnl_peak >= PROFIT_LOCK_ARM_PCT * base
           and realized <= daily_pnl_peak * (1.0 - PROFIT_LOCK_GIVEBACK_PCT)):
@@ -2972,6 +3024,39 @@ except Exception:
     log.error("TRADE_WINDOW_TZ %r unknown — falling back to UTC.", TRADE_WINDOW_TZ)
     _trade_window_tz = timezone.utc
 _trade_window = _parse_trade_window(TRADE_WINDOW)
+
+
+def _effective_profit_target_pct(now: Optional[datetime] = None) -> float:
+    """The day's profit-lock target as a fraction of session-start balance.
+
+    Inside (and before) the golden window the target is the full stretch
+    PROFIT_LOCK_TARGET_PCT — we hold out for the big morning win. After the
+    window closes it LADDERS DOWN linearly toward DAILY_MIN_TARGET_PCT (the 3%
+    compounding floor) over DAILY_TARGET_DECAY_HOURS, so a day that could not
+    print the stretch target early banks whatever it can as the day wears on
+    rather than chasing 40% into the give-back zone. Never returns below the
+    floor. With the ladder disabled, no window configured, or a mis-ordered
+    hi/lo, it is a constant PROFIT_LOCK_TARGET_PCT (v9.10.0 behaviour)."""
+    hi = PROFIT_LOCK_TARGET_PCT
+    lo = DAILY_MIN_TARGET_PCT
+    if not DAILY_TARGET_LADDER_ENABLED or _trade_window is None or hi <= lo:
+        return hi
+    if now is None:
+        now = datetime.now(_trade_window_tz)
+    m = now.hour * 60 + now.minute
+    start, end = _trade_window
+    inside = (start <= m < end) if start < end else (m >= start or m < end)
+    if inside:
+        return hi
+    if start < end:
+        if m < start:
+            return hi                       # before this morning's window opens
+        mins_after = m - end
+    else:                                   # overnight window: minutes past close
+        mins_after = (m - end) % (24 * 60)
+    span = max(1.0, DAILY_TARGET_DECAY_HOURS * 60.0)
+    frac = min(1.0, mins_after / span)
+    return max(lo, hi - (hi - lo) * frac)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3041,11 +3126,22 @@ def trade_window_check(now: Optional[datetime] = None) -> bool:
     m = now.hour * 60 + now.minute
     start, end = _trade_window
     inside = (start <= m < end) if start < end else (m >= start or m < end)
-    if not inside:
-        log.info("Trade window │ %02d:%02d %s outside %s", now.hour, now.minute,
-                 TRADE_WINDOW_TZ, TRADE_WINDOW)
-        return False
-    return True
+    if inside:
+        return True
+    # v9.11.0: the window no longer hard-STOPS the day. Once it closes we keep
+    # trading until the day's goal is banked — i.e. until the profit lock trips.
+    # Its target ladders down toward the 3% floor after the window (see
+    # _effective_profit_target_pct), so the day still ends on a locked gain, not
+    # on the clock. Only a day that is already profit-locked goes dark early.
+    if WINDOW_EXTEND_UNTIL_GOAL and not _profit_locked:
+        log.info("Trade window │ %02d:%02d %s past %s — daily goal not yet locked, "
+                 "staying open to chase it (target now %.0f%%).",
+                 now.hour, now.minute, TRADE_WINDOW_TZ, TRADE_WINDOW,
+                 _effective_profit_target_pct(now) * 100)
+        return True
+    log.info("Trade window │ %02d:%02d %s outside %s", now.hour, now.minute,
+             TRADE_WINDOW_TZ, TRADE_WINDOW)
+    return False
 
 
 def streak_check() -> bool:
@@ -3187,8 +3283,8 @@ def telegram_boot(balance: float) -> None:
         f"AGREE-gate={'ON' if REQUIRE_AGREE_MOMENTUM else 'OFF'} | "
         f"Breakeven≤{YES_BREAKEVEN_PRICE}c\n"
         f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}\n"
-        f"ProfitLock={'target +%.0f%%, trail %.0f%%/−%.0f%%' % (PROFIT_LOCK_TARGET_PCT * 100, PROFIT_LOCK_ARM_PCT * 100, PROFIT_LOCK_GIVEBACK_PCT * 100) if PROFIT_LOCK_ENABLED else 'OFF'} | "
-        f"Window={TRADE_WINDOW + ' ' + TRADE_WINDOW_TZ if _trade_window else 'none'}"
+        f"ProfitLock={'target +%.0f%%→+%.0f%% floor over %.0fh, trail %.0f%%/−%.0f%%' % (PROFIT_LOCK_TARGET_PCT * 100, DAILY_MIN_TARGET_PCT * 100, DAILY_TARGET_DECAY_HOURS, PROFIT_LOCK_ARM_PCT * 100, PROFIT_LOCK_GIVEBACK_PCT * 100) if PROFIT_LOCK_ENABLED else 'OFF'} | "
+        f"Window={(TRADE_WINDOW + ' ' + TRADE_WINDOW_TZ + (' +extend-until-goal' if WINDOW_EXTEND_UNTIL_GOAL else '')) if _trade_window else 'none'}"
     )
 
 
@@ -3267,6 +3363,7 @@ def write_status_snapshot(balance: float) -> None:
             "halted": _session_halted,
             "profit_locked": _profit_locked,
             "daily_pnl_peak": round(float(daily_pnl_peak), 2),
+            "daily_target_pct": round(_effective_profit_target_pct() * 100, 1),
             "last_signal": last_signal_desc,
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
