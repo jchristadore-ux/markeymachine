@@ -2278,18 +2278,25 @@ class TestProfitLock:
     def setup_method(self):
         self._saved = (bot.PROFIT_LOCK_ENABLED, bot.PROFIT_LOCK_TARGET_PCT,
                        bot.PROFIT_LOCK_ARM_PCT, bot.PROFIT_LOCK_GIVEBACK_PCT,
-                       bot.session_start_balance, bot.paper_daily_pnl)
+                       bot.session_start_balance, bot.paper_daily_pnl,
+                       bot.DAILY_TARGET_LADDER_ENABLED)
         bot.PROFIT_LOCK_ENABLED      = True
         bot.PROFIT_LOCK_TARGET_PCT   = 0.40
         bot.PROFIT_LOCK_ARM_PCT      = 0.15
         bot.PROFIT_LOCK_GIVEBACK_PCT = 0.30
         bot.session_start_balance    = 1000.0
+        # These tests exercise the base v9.10.0 lock mechanics with a FLAT target,
+        # so pin the v9.11.0 daily-target ladder off (otherwise the effective
+        # target would decay with the wall clock and make the suite time-flaky).
+        # The ladder has its own coverage in TestDailyTargetLadder.
+        bot.DAILY_TARGET_LADDER_ENABLED = False
         self._reset_state()
 
     def teardown_method(self):
         (bot.PROFIT_LOCK_ENABLED, bot.PROFIT_LOCK_TARGET_PCT,
          bot.PROFIT_LOCK_ARM_PCT, bot.PROFIT_LOCK_GIVEBACK_PCT,
-         bot.session_start_balance, bot.paper_daily_pnl) = self._saved
+         bot.session_start_balance, bot.paper_daily_pnl,
+         bot.DAILY_TARGET_LADDER_ENABLED) = self._saved
         self._reset_state()
 
     @staticmethod
@@ -2429,15 +2436,25 @@ class TestProfitLock:
 
 
 class TestTradeWindow:
-    """v9.10.0 exchange-local entry window. 2026-07-13: all wins were on the
-    4:30-6:00am ET markets, all losses on 8:00am+ — the gate only admits
-    entries inside TRADE_WINDOW and fails open on a bad spec."""
+    """v9.10.0 exchange-local entry window + v9.11.0 extend-until-goal. The
+    window admits entries inside TRADE_WINDOW; v9.11.0 keeps it OPEN past the
+    close until the day is profit-locked (goal met) so a slow morning still gets
+    the rest of the day to compound. WINDOW_EXTEND_UNTIL_GOAL=False restores the
+    v9.10.0 hard window."""
 
     @staticmethod
     def _et(hour, minute):
         from zoneinfo import ZoneInfo
         from datetime import datetime as _dt
         return _dt(2026, 7, 13, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+
+    def setup_method(self):
+        # trade_window_check now reads _profit_locked; keep it deterministic.
+        self._saved_locked = bot._profit_locked
+        bot._profit_locked = False
+
+    def teardown_method(self):
+        bot._profit_locked = self._saved_locked
 
     def test_parse_valid_window(self):
         assert bot._parse_trade_window("04:00-07:30") == (240, 450)
@@ -2456,14 +2473,39 @@ class TestTradeWindow:
         assert bot.trade_window_check(self._et(6, 15)) is True
         assert bot.trade_window_check(self._et(7, 29)) is True
 
-    def test_outside_window_blocks(self, monkeypatch):
+    def test_hard_window_blocks_outside_when_extend_off(self, monkeypatch):
+        # v9.10.0 behaviour, restored by WINDOW_EXTEND_UNTIL_GOAL=False.
         monkeypatch.setattr(bot, "_trade_window", (240, 450))
+        monkeypatch.setattr(bot, "WINDOW_EXTEND_UNTIL_GOAL", False)
         assert bot.trade_window_check(self._et(3, 59)) is False
         assert bot.trade_window_check(self._et(7, 30)) is False  # end-exclusive
         assert bot.trade_window_check(self._et(10, 45)) is False # 07-13 loss hours
 
+    def test_extend_keeps_open_past_window_until_goal(self, monkeypatch):
+        # v9.11.0: past the close, an UNLOCKED (goal-unmet) day stays open so it
+        # can keep grinding toward the goal instead of going dark on the clock.
+        monkeypatch.setattr(bot, "_trade_window", (240, 450))
+        monkeypatch.setattr(bot, "WINDOW_EXTEND_UNTIL_GOAL", True)
+        monkeypatch.setattr(bot, "_profit_locked", False)
+        assert bot.trade_window_check(self._et(7, 30)) is True   # just past close
+        assert bot.trade_window_check(self._et(10, 45)) is True  # old loss hours
+        assert bot.trade_window_check(self._et(15, 0)) is True
+
+    def test_extend_closes_once_goal_locked(self, monkeypatch):
+        # Once the day IS profit-locked (goal met) the window goes dark on time —
+        # the wins are banked; no chasing past the close.
+        monkeypatch.setattr(bot, "_trade_window", (240, 450))
+        monkeypatch.setattr(bot, "WINDOW_EXTEND_UNTIL_GOAL", True)
+        monkeypatch.setattr(bot, "_profit_locked", True)
+        assert bot.trade_window_check(self._et(7, 30)) is False
+        assert bot.trade_window_check(self._et(10, 45)) is False
+        # ...but inside the window a locked day is still gated by profit_lock_check
+        # elsewhere, so the window itself still reports "inside".
+        assert bot.trade_window_check(self._et(6, 0)) is True
+
     def test_overnight_window_wraps_midnight(self, monkeypatch):
         monkeypatch.setattr(bot, "_trade_window", (1320, 240))  # 22:00-04:00
+        monkeypatch.setattr(bot, "WINDOW_EXTEND_UNTIL_GOAL", False)
         assert bot.trade_window_check(self._et(23, 0)) is True
         assert bot.trade_window_check(self._et(1, 30)) is True
         assert bot.trade_window_check(self._et(12, 0)) is False
@@ -2471,3 +2513,81 @@ class TestTradeWindow:
     def test_disabled_window_always_passes(self, monkeypatch):
         monkeypatch.setattr(bot, "_trade_window", None)
         assert bot.trade_window_check(self._et(12, 0)) is True
+
+
+class TestDailyTargetLadder:
+    """v9.11.0 daily goal ladder: aim for the full PROFIT_LOCK_TARGET_PCT in the
+    golden window, then decay the effective lock target toward
+    DAILY_MIN_TARGET_PCT over DAILY_TARGET_DECAY_HOURS so a day that can't print
+    40% still banks (and compounds) whatever it can, floored at 3%."""
+
+    @staticmethod
+    def _et(hour, minute):
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+        return _dt(2026, 7, 13, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+
+    def setup_method(self):
+        self._saved = (bot.PROFIT_LOCK_TARGET_PCT, bot.DAILY_MIN_TARGET_PCT,
+                       bot.DAILY_TARGET_DECAY_HOURS, bot.DAILY_TARGET_LADDER_ENABLED,
+                       bot._trade_window)
+        bot.PROFIT_LOCK_TARGET_PCT      = 0.40
+        bot.DAILY_MIN_TARGET_PCT        = 0.03
+        bot.DAILY_TARGET_DECAY_HOURS    = 8.0
+        bot.DAILY_TARGET_LADDER_ENABLED = True
+        bot._trade_window               = (240, 450)   # 04:00-07:30 ET
+
+    def teardown_method(self):
+        (bot.PROFIT_LOCK_TARGET_PCT, bot.DAILY_MIN_TARGET_PCT,
+         bot.DAILY_TARGET_DECAY_HOURS, bot.DAILY_TARGET_LADDER_ENABLED,
+         bot._trade_window) = self._saved
+
+    def test_full_target_inside_window(self):
+        assert bot._effective_profit_target_pct(self._et(6, 0)) == 0.40
+
+    def test_full_target_before_window(self):
+        # Pre-dawn, before the window opens → still the full stretch target.
+        assert bot._effective_profit_target_pct(self._et(2, 0)) == 0.40
+
+    def test_full_target_at_window_close(self):
+        # The instant the window closes the target is still the full stretch.
+        assert bot._effective_profit_target_pct(self._et(7, 30)) == 0.40
+
+    def test_target_decays_after_window(self):
+        # 4h past a 07:30 close is halfway through the 8h decay: 40% → ~21.5%.
+        pct = bot._effective_profit_target_pct(self._et(11, 30))
+        assert abs(pct - (0.40 - 0.5 * (0.40 - 0.03))) < 1e-9
+
+    def test_target_floors_at_minimum(self):
+        # Well past the decay span, the target sits on the 3% compounding floor.
+        assert abs(bot._effective_profit_target_pct(self._et(20, 0)) - 0.03) < 1e-9
+
+    def test_ladder_disabled_is_flat(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_TARGET_LADDER_ENABLED", False)
+        assert bot._effective_profit_target_pct(self._et(20, 0)) == 0.40
+
+    def test_no_window_is_flat(self, monkeypatch):
+        monkeypatch.setattr(bot, "_trade_window", None)
+        assert bot._effective_profit_target_pct(self._et(20, 0)) == 0.40
+
+    def test_laddered_target_locks_a_modest_afternoon_gain(self, monkeypatch):
+        # Integration: a day that only made 12% by mid-afternoon would NOT lock
+        # on the flat 40% target, but the decayed target catches down to it and
+        # banks the gain (the compounding win) instead of risking it all day.
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+        monkeypatch.setattr(bot, "PROFIT_LOCK_ENABLED", True)
+        monkeypatch.setattr(bot, "PROFIT_LOCK_ARM_PCT", 0.0)   # isolate the target trigger
+        monkeypatch.setattr(bot, "session_start_balance", 1000.0)
+        monkeypatch.setattr(bot, "paper_daily_pnl", 120.0)     # +12%
+        monkeypatch.setattr(bot, "daily_pnl_peak", 0.0)
+        monkeypatch.setattr(bot, "_pl_realized_offset", 0.0)
+        monkeypatch.setattr(bot, "_profit_locked", False)
+        # Freeze "now" deep into the afternoon where the target has decayed ≤12%.
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        real = _dt(2026, 7, 13, 20, 0, tzinfo=ZoneInfo("America/New_York"))
+        assert bot._effective_profit_target_pct(real) <= 0.12
+        monkeypatch.setattr(bot, "_effective_profit_target_pct",
+                            lambda *a, **k: bot.DAILY_MIN_TARGET_PCT)
+        bot.update_profit_lock(1120.0)
+        assert bot._profit_locked is True
